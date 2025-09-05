@@ -463,7 +463,7 @@ aws_account_check() {
     echo
     echo "Based on the selected options: " 
     (( audts == 0 )) && echo " - Audit Log Collection not enabled" || echo " - Audit Log Collection enabled"
-    (( feats == 0 )) && echo " - DSPM, Registry Scanning and Serverless function scanning disabled." || echo " - DSPM, Registry Scanning or/and Serverless function Scanning enabled."
+    (( feats == 0 )) && echo " - DSPM, Registry Scanning and Serverless function scanning disabled." || echo " - DSPM, Registry Scanning and/or Serverless function Scanning enabled."
     echo
     echo "This identity was checked:"
     echo " - Identity ARN: $IDENTITY_ARN"
@@ -524,7 +524,7 @@ aws_organization_check() {
         ROLE_NAME=$(echo "$IDENTITY_ARN" | awk -F'/' '{print $2}')
         ENTITY_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
     elif [[ "$IDENTITY_ARN" == *":root" ]]; then
-        echo "Detected CloudShell root ARN — All permission are satisfied"
+        echo "Detected CloudShell root ARN — All permissions are satisfied"
         exit 1
     else
         echo "Unsupported identity type: $IDENTITY_ARN"
@@ -594,7 +594,7 @@ aws_organization_check() {
     echo
     echo "Based on the selected options: " 
     (( audts == 0 )) && echo " - Audit Log Collection not enabled" || echo " - Audit Log Collection enabled"
-    (( feats == 0 )) && echo " - DSPM, Registry Scanning and Serverless function scanning disabled." || echo " - DSPM, Registry Scanning or/and Serverless function Scanning enabled."
+    (( feats == 0 )) && echo " - DSPM, Registry Scanning and Serverless function scanning disabled." || echo " - DSPM, Registry Scanning and/or Serverless function Scanning enabled."
     echo
     echo "This identity was checked:"
     echo " - Identity ARN: $IDENTITY_ARN"
@@ -679,7 +679,7 @@ azure_subscription_check() {
     # wildcard matcher: allow patterns like Microsoft.*/*/read
     _match() { local pat="$1" str="$2"; [[ "$str" == $pat ]]; }
 
-    echo "Are you enabling Audit Log Collecton?"
+    echo "Are you enabling Audit Log Collection?"
     read -p "Enter your choice of yes or no (y or n): " audit_logs
     local audts=0
 
@@ -1320,7 +1320,7 @@ provider=""
 #     read -rp "Choose provider (aws-account/aws-org/azure-sub/azure-mg/azure-tenant/gcp-project/gcp-org): " provider
 # fi
 
-# # Normalizinf in lowercase
+# # Normalizing in lowercase
 # provider="$(tr '[:upper:]' '[:lower:]' <<<"$provider")"
 
 print_header "Preflight Permissions Check Menu"

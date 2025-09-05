@@ -23,8 +23,8 @@ Run the script from the matching cloud shell. If you run it locally, install and
 ### Azure
 - Set the subscription you want to test: az account set --subscription "<SUBSCRIPTION_ID>"
 - The identity needs to be able to read role assignments/definitions (e.g., Microsoft.Authorization/roleAssignments/read, .../roleDefinitions/read)
-- For Azure tenant, the identity need to be able to read roles at Entra ID level.
-- This is only to see if you have permisisons to onboard Management Groups and Subscriptions from a tenant that already has the enterprise application approved.
+ - For Azure tenant, the identity needs to be able to read roles at Entra ID level.
+ - This is only to see if you have permissions to onboard Management Groups and Subscriptions from a tenant that already has the enterprise application approved.
 
 ### GCP
 - Set project for project checks: gcloud config set project <PROJECT_ID>
