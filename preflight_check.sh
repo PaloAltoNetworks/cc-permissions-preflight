@@ -1034,7 +1034,9 @@ gcp_project_check() {
     esac
 
     # de-dup + strip empties
-    mapfile -t req_perms < <(printf '%s\n' "${req_perms[@]}" | awk 'NF' | sort -u)
+    while IFS= read -r line; do
+        req_perms+=("$line")
+    done < <(printf '%s\n' "${req_perms[@]}" | awk 'NF' | sort -u)
 
     # nothing to check?
     if ((${#req_perms[@]} == 0)); then
@@ -1052,29 +1054,63 @@ gcp_project_check() {
 
     _test_batch() {
         local -a batch=("$@")
-        local json_perms payload resp
+        local json_perms payload resp resource
         json_perms="$(printf '%s\n' "${batch[@]}" | jq -R . | jq -s .)"
         payload="$(jq -n --argjson perms "$json_perms" '{permissions:$perms}')"
+
+        # pick the right resource endpoint for this batch
+        # (for now, use the first permission as a hint — keep batches grouped by type)
+        case "${batch[0]}" in
+            iam.serviceAccounts.*)
+                # requires a specific service account; pick the default or prompt
+                local SA_EMAIL
+                SA_EMAIL="$(gcloud iam service-accounts list --project "$PROJECT_ID" --format='value(email)' | head -n1)"
+                [[ -z "$SA_EMAIL" ]] && { echo "No service accounts found in project" >&2; return 3; }
+                resource="https://iam.googleapis.com/v1/projects/${PROJECT_ID}/serviceAccounts/${SA_EMAIL}"
+                ;;
+            pubsub.topics.*)
+                # requires a topic; pick one or create a dummy name
+                local TOPIC
+                TOPIC="$(gcloud pubsub topics list --project "$PROJECT_ID" --format='value(name)' | head -n1)"
+                [[ -z "$TOPIC" ]] && TOPIC="projects/${PROJECT_ID}/topics/dummy"
+                resource="https://pubsub.googleapis.com/v1/${TOPIC}"
+                ;;
+            pubsub.subscriptions.*)
+                local SUB
+                SUB="$(gcloud pubsub subscriptions list --project "$PROJECT_ID" --format='value(name)' | head -n1)"
+                [[ -z "$SUB" ]] && SUB="projects/${PROJECT_ID}/subscriptions/dummy"
+                resource="https://pubsub.googleapis.com/v1/${SUB}"
+                ;;
+            logging.sinks.*)
+                resource="https://logging.googleapis.com/v2/projects/${PROJECT_ID}"
+                ;;
+            *)
+                # default: project-level perms
+                resource="https://cloudresourcemanager.googleapis.com/v1/projects/${PROJECT_ID}"
+                ;;
+        esac
 
         resp="$(curl -sS -X POST \
             -H "Authorization: Bearer ${ACCESS_TOKEN}" \
             -H "Content-Type: application/json" \
             -d "$payload" \
-            "https://cloudresourcemanager.googleapis.com/v1/projects/${PROJECT_ID}:testIamPermissions")" || return 3
+            "${resource}:testIamPermissions")" || return 3
 
-      # error handling
         if jq -e '.error' >/dev/null 2>&1 <<<"$resp"; then
             echo -e "${RED}Error from testIamPermissions:${NC} $(jq -r '.error.message' <<<"$resp")" >&2
             return 3
         fi
 
-        mapfile -t granted_batch < <(jq -r '.permissions[]?' <<<"$resp")
-        # mark any not returned as missing
+        granted_batch=()
+        while IFS= read -r line; do
+            granted_batch+=("$line")
+        done < <(jq -r '.permissions[]?' <<<"$resp")
+
         local p had
         for p in "${batch[@]}"; do
             had=""
             for g in "${granted_batch[@]}"; do
-            [[ "$p" == "$g" ]] && { had=1; break; }
+                [[ "$p" == "$g" ]] && { had=1; break; }
             done
             [[ -z "$had" ]] && missing+=("$p")
         done
@@ -1100,7 +1136,8 @@ gcp_project_check() {
         return 0
     else
         echo -e "${RED}Missing permissions:${NC}"
-        printf ' - %s\n' "${missing[@]}"
+        # dedup + sort before printing
+        printf '%s\n' "${missing[@]}" | sort -u | sed 's/^/ - /'
         return 1
     fi
 }
