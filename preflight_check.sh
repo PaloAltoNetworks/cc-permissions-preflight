@@ -280,11 +280,14 @@ PERMISSIONS_AZURE_MG_BASE=(
     "Microsoft.ManagedIdentity/userAssignedIdentities/assign/action"
     "Microsoft.Management/managementGroups/descendants/read"
     "Microsoft.Management/managementGroups/subscriptions/read"
-)
-PERMISSIONS_AZURE_MG_AUDIT_LOGS=(
     "Microsoft.Resources/subscriptions/resourcegroups/read"
     "Microsoft.Resources/subscriptions/resourcegroups/write"
     "Microsoft.Resources/subscriptions/resourceGroups/delete"
+    "Microsoft.Resources/subscriptions/resourceGroups/moveResources/action"
+    "Microsoft.Resources/subscriptions/resourceGroups/validateMoveResources/action"
+    
+)
+PERMISSIONS_AZURE_MG_AUDIT_LOGS=(
     "Microsoft.Resources/deploymentScripts/write"
     "Microsoft.Resources/deploymentScripts/read"
     "Microsoft.Resources/deploymentScripts/delete"
