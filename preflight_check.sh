@@ -240,11 +240,6 @@ PERMISSIONS_AZURE_MG_BASE=(
     "Microsoft.Authorization/roleManagementPolicies/read"
     "Microsoft.Authorization/roleManagementPolicies/write"
     "Microsoft.Authorization/roleManagementPolicyAssignments/read"
-    "Microsoft.aadiam/diagnosticsettings/write"
-    "Microsoft.aadiam/diagnosticsettings/read"
-    "Microsoft.aadiam/diagnosticsettings/delete"
-    "Microsoft.aadiam/azureADMetrics/providers/Microsoft.Insights/diagnosticSettings/write"
-    "Microsoft.aadiam/tenants/providers/Microsoft.Insights/diagnosticSettings/write"
     "Microsoft.Resources/deployments/validate/action"
     "Microsoft.Insights/DiagnosticSettings/Write"
     "Microsoft.Resources/deployments/read"
@@ -621,7 +616,6 @@ azure_subscription_check() {
     # providers needed to check list
     local PROVIDERS_TO_CHECK=(
         "Microsoft.Insights"
-        "Microsoft.Aadiam"
     )
 
     # get the current subscription ID dynamically
@@ -971,7 +965,6 @@ azure_management_group_check() {
     # providers needed to check list
     local PROVIDERS_TO_CHECK=(
         "Microsoft.Insights"
-        "Microsoft.Aadiam"
     )
 
     # get the current subscription ID dynamically
@@ -1397,7 +1390,6 @@ azure_tenant_check() {
     # providers needed to check list
     local PROVIDERS_TO_CHECK=(
         "Microsoft.Insights"
-        "Microsoft.Aadiam"
     )
 
     # get the current subscription ID dynamically
