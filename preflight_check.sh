@@ -632,6 +632,9 @@ azure_subscription_check() {
     # this flag will be set to 'false' if any provider fails the check
     ALL_CHECKS_PASSED=true
 
+    # Initialize an array to track failures
+    FAILED_PROVIDERS=()
+
     # main Check Loop
     for provider in "${PROVIDERS_TO_CHECK[@]}"; do
         echo -n "Checking provider: $provider ... "
@@ -647,17 +650,20 @@ azure_subscription_check() {
             echo -e "${YELLOW}⚠️  Registering${NC}"
             echo -e "   ${YELLOW}-> This provider is still registering. Please wait 5–15 minutes and re-run this check.${NC}"
             ALL_CHECKS_PASSED=false
+            FAILED_PROVIDERS+=("$provider (Status: Registering)")
             
         elif [ "$STATE" == "NotRegistered" ]; then
             echo -e "${RED}❌ Not Registered${NC}"
             echo -e "   ${YELLOW}-> SOLUTION:${NC} This provider is required. Run the following command:"
             echo -e "      ${BOLD}az provider register --namespace $provider --subscription $CURRENT_SUBSCRIPTION${NC}"
             ALL_CHECKS_PASSED=false
+            FAILED_PROVIDERS+=("$provider (Status: Not Registered)")
             
         else
             echo -e "${RED}❓ Unknown State:${NC} $STATE"
             echo "   -> An unexpected status was returned. Please check in the Azure Portal."
             ALL_CHECKS_PASSED=false
+            FAILED_PROVIDERS+=("$provider (Status: Unknown - $STATE)")
         fi
     done
 
@@ -667,9 +673,15 @@ azure_subscription_check() {
         
     else
         echo ""
-        echo -e "${RED}🔴 FAILED: One or more providers are not registered."
+        echo -e "${RED}🔴 FAILED: The following providers need attention:"
+        # Loop through the failure list
+        for p in "${FAILED_PROVIDERS[@]}"; do
+            echo -e "   - ${YELLOW}$p${NC}"
+        done
+        
+        echo ""
         echo -e "   ${YELLOW}After fixing, re-run this script to confirm.${NC}"
-        log_error "❌ One or more provider is NOT registered."
+        log_error "❌ Provider check failed for: ${FAILED_PROVIDERS[*]}"
     fi
     #end of resource providers check
 
@@ -981,6 +993,9 @@ azure_management_group_check() {
     # this flag will be set to 'false' if any provider fails the check
     ALL_CHECKS_PASSED=true
 
+    # Initialize an array to track failures
+    FAILED_PROVIDERS=()
+
     # main Check Loop
     for provider in "${PROVIDERS_TO_CHECK[@]}"; do
         echo -n "Checking provider: $provider ... "
@@ -996,17 +1011,20 @@ azure_management_group_check() {
             echo -e "${YELLOW}⚠️  Registering${NC}"
             echo -e "   ${YELLOW}-> This provider is still registering. Please wait 5–15 minutes and re-run this check.${NC}"
             ALL_CHECKS_PASSED=false
+            FAILED_PROVIDERS+=("$provider (Status: Registering)")
             
         elif [ "$STATE" == "NotRegistered" ]; then
             echo -e "${RED}❌ Not Registered${NC}"
             echo -e "   ${YELLOW}-> SOLUTION:${NC} This provider is required. Run the following command:"
             echo -e "      ${BOLD}az provider register --namespace $provider --subscription $CURRENT_SUBSCRIPTION${NC}"
             ALL_CHECKS_PASSED=false
+            FAILED_PROVIDERS+=("$provider (Status: Not Registered)")
             
         else
             echo -e "${RED}❓ Unknown State:${NC} $STATE"
             echo "   -> An unexpected status was returned. Please check in the Azure Portal."
             ALL_CHECKS_PASSED=false
+            FAILED_PROVIDERS+=("$provider (Status: Unknown - $STATE)")
         fi
     done
 
@@ -1016,9 +1034,15 @@ azure_management_group_check() {
         
     else
         echo ""
-        echo -e "${RED}🔴 FAILED: One or more providers are not registered."
+        echo -e "${RED}🔴 FAILED: The following providers need attention:"
+        # Loop through the failure list
+        for p in "${FAILED_PROVIDERS[@]}"; do
+            echo -e "   - ${YELLOW}$p${NC}"
+        done
+        
+        echo ""
         echo -e "   ${YELLOW}After fixing, re-run this script to confirm.${NC}"
-        log_error "❌ One or more provider is NOT registered."
+        log_error "❌ Provider check failed for: ${FAILED_PROVIDERS[*]}"
     fi
     #end of resource providers check
 
@@ -1406,6 +1430,9 @@ azure_tenant_check() {
     # this flag will be set to 'false' if any provider fails the check
     ALL_CHECKS_PASSED=true
 
+    # Initialize an array to track failures
+    FAILED_PROVIDERS=()
+
     # main Check Loop
     for provider in "${PROVIDERS_TO_CHECK[@]}"; do
         echo -n "Checking provider: $provider ... "
@@ -1421,17 +1448,20 @@ azure_tenant_check() {
             echo -e "${YELLOW}⚠️  Registering${NC}"
             echo -e "   ${YELLOW}-> This provider is still registering. Please wait 5–15 minutes and re-run this check.${NC}"
             ALL_CHECKS_PASSED=false
+            FAILED_PROVIDERS+=("$provider (Status: Registering)")
             
         elif [ "$STATE" == "NotRegistered" ]; then
             echo -e "${RED}❌ Not Registered${NC}"
             echo -e "   ${YELLOW}-> SOLUTION:${NC} This provider is required. Run the following command:"
             echo -e "      ${BOLD}az provider register --namespace $provider --subscription $CURRENT_SUBSCRIPTION${NC}"
             ALL_CHECKS_PASSED=false
+            FAILED_PROVIDERS+=("$provider (Status: Not Registered)")
             
         else
             echo -e "${RED}❓ Unknown State:${NC} $STATE"
             echo "   -> An unexpected status was returned. Please check in the Azure Portal."
             ALL_CHECKS_PASSED=false
+            FAILED_PROVIDERS+=("$provider (Status: Unknown - $STATE)")
         fi
     done
 
@@ -1441,9 +1471,15 @@ azure_tenant_check() {
         
     else
         echo ""
-        echo -e "${RED}🔴 FAILED: One or more providers are not registered."
+        echo -e "${RED}🔴 FAILED: The following providers need attention:"
+        # Loop through the failure list
+        for p in "${FAILED_PROVIDERS[@]}"; do
+            echo -e "   - ${YELLOW}$p${NC}"
+        done
+        
+        echo ""
         echo -e "   ${YELLOW}After fixing, re-run this script to confirm.${NC}"
-        log_error "❌ One or more provider is NOT registered."
+        log_error "❌ Provider check failed for: ${FAILED_PROVIDERS[*]}"
     fi
     #end of resource providers check
 
