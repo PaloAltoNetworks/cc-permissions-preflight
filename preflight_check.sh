@@ -280,6 +280,8 @@ PERMISSIONS_AZURE_MG_AUDIT_LOGS=(
     "Microsoft.Resources/subscriptions/resourcegroups/read"
     "Microsoft.Resources/subscriptions/resourcegroups/write"
     "Microsoft.Resources/subscriptions/resourceGroups/delete"
+    "Microsoft.Resources/subscriptions/resourceGroups/moveResources/action"
+    "Microsoft.Resources/subscriptions/resourceGroups/validateMoveResources/action"
     "Microsoft.Resources/deploymentScripts/write"
     "Microsoft.Resources/deploymentScripts/read"
     "Microsoft.Resources/deploymentScripts/delete"
@@ -628,6 +630,14 @@ azure_subscription_check() {
 
     echo "Using subscription: $CURRENT_SUBSCRIPTION"
     echo
+        
+    az account set --subscription "$CURRENT_SUBSCRIPTION" 2>/dev/null
+
+    if [ $? -ne 0 ]; then
+        echo "❌ ERROR: Failed to set Azure subscription context."
+        log_error "❌ Failed to set Azure subscription context: $CURRENT_SUBSCRIPTION"
+        exit 1
+    fi
 
     # this flag will be set to 'false' if any provider fails the check
     ALL_CHECKS_PASSED=true
@@ -652,7 +662,7 @@ azure_subscription_check() {
             ALL_CHECKS_PASSED=false
             FAILED_PROVIDERS+=("$provider (Status: Registering)")
             
-        elif [ "$STATE" == "NotRegistered" ]; then
+        elif [ "$STATE" == "NotRegistered" ] || [ "$STATE" == "Unregistered" ]; then
             echo -e "${RED}❌ Not Registered${NC}"
             echo -e "   ${YELLOW}-> SOLUTION:${NC} This provider is required. Run the following command:"
             echo -e "      ${BOLD}az provider register --namespace $provider --subscription $CURRENT_SUBSCRIPTION${NC}"
@@ -989,6 +999,14 @@ azure_management_group_check() {
 
     echo "Using subscription: $CURRENT_SUBSCRIPTION"
     echo
+        
+    az account set --subscription "$CURRENT_SUBSCRIPTION" 2>/dev/null
+
+    if [ $? -ne 0 ]; then
+        echo "❌ ERROR: Failed to set Azure subscription context."
+        log_error "❌ Failed to set Azure subscription context: $CURRENT_SUBSCRIPTION"
+        exit 1
+    fi
 
     # this flag will be set to 'false' if any provider fails the check
     ALL_CHECKS_PASSED=true
@@ -1013,7 +1031,7 @@ azure_management_group_check() {
             ALL_CHECKS_PASSED=false
             FAILED_PROVIDERS+=("$provider (Status: Registering)")
             
-        elif [ "$STATE" == "NotRegistered" ]; then
+        elif [ "$STATE" == "NotRegistered" ] || [ "$STATE" == "Unregistered" ]; then
             echo -e "${RED}❌ Not Registered${NC}"
             echo -e "   ${YELLOW}-> SOLUTION:${NC} This provider is required. Run the following command:"
             echo -e "      ${BOLD}az provider register --namespace $provider --subscription $CURRENT_SUBSCRIPTION${NC}"
@@ -1427,6 +1445,14 @@ azure_tenant_check() {
     echo "Using subscription: $CURRENT_SUBSCRIPTION"
     echo
 
+    az account set --subscription "$CURRENT_SUBSCRIPTION" 2>/dev/null
+
+    if [ $? -ne 0 ]; then
+        echo "❌ ERROR: Failed to set Azure subscription context."
+        log_error "❌ Failed to set Azure subscription context: $CURRENT_SUBSCRIPTION"
+        exit 1
+    fi
+
     # this flag will be set to 'false' if any provider fails the check
     ALL_CHECKS_PASSED=true
 
@@ -1450,7 +1476,7 @@ azure_tenant_check() {
             ALL_CHECKS_PASSED=false
             FAILED_PROVIDERS+=("$provider (Status: Registering)")
             
-        elif [ "$STATE" == "NotRegistered" ]; then
+        elif [ "$STATE" == "NotRegistered" ] || [ "$STATE" == "Unregistered" ]; then
             echo -e "${RED}❌ Not Registered${NC}"
             echo -e "   ${YELLOW}-> SOLUTION:${NC} This provider is required. Run the following command:"
             echo -e "      ${BOLD}az provider register --namespace $provider --subscription $CURRENT_SUBSCRIPTION${NC}"
