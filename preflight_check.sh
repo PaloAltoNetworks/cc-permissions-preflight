@@ -275,6 +275,16 @@ PERMISSIONS_AZURE_MG_BASE=(
     "Microsoft.ManagedIdentity/userAssignedIdentities/assign/action"
     "Microsoft.Management/managementGroups/descendants/read"
     "Microsoft.Management/managementGroups/subscriptions/read"
+    "Microsoft.Resources/deployments/*",
+    "Microsoft.Resources/subscriptions/resourceGroups/*",
+    "Microsoft.Resources/subscriptions/read",
+    "Microsoft.Authorization/roleDefinitions/*",
+    "Microsoft.Authorization/roleAssignments/*",
+    "Microsoft.Authorization/policyDefinitions/*",
+    "Microsoft.Authorization/policyAssignments/*",
+    "Microsoft.EventHub/namespaces/*",
+    "Microsoft.Insights/diagnosticSettings/*",
+    "Microsoft.Compute/galleries/*"
 )
 PERMISSIONS_AZURE_MG_AUDIT_LOGS=(
     "Microsoft.Resources/subscriptions/resourcegroups/read"
@@ -610,18 +620,171 @@ aws_organization_check() {
         echo "Please contact an administrator to enable those permissions."
     fi
 }
+
+azure_management_group_policy_check() {
+    echo
+    print_header "Starting Azure Management Group Cortex Policy Validation"
+    echo
+
+    # Input validation (align with your script style)
+    if [ -z "$MANAGEMENT_GROUP_ID" ]; then
+        echo -e "${RED}❌ ERROR: MANAGEMENT_GROUP_ID is not set.${NC}"
+        echo "Usage: export MANAGEMENT_GROUP_ID=<your-mg-id>"
+        log_error "❌ Missing MANAGEMENT_GROUP_ID"
+        return 1
+    fi
+
+    if [ -z "${MANAGEMENT_GROUP_ID// /}" ]; then
+        echo -e "${RED}❌ ERROR: Management Group ID cannot be empty or whitespace.${NC}"
+        log_error "❌ Invalid MANAGEMENT_GROUP_ID"
+        return 1
+    fi
+
+    MANAGEMENT_GROUP_SCOPE="/providers/Microsoft.Management/managementGroups/${MANAGEMENT_GROUP_ID}"
+
+    echo "Target Management Group: $MANAGEMENT_GROUP_ID"
+    echo "--------------------------------------------------"
+
+    # STEP 1: Find Cortex Policy Assignment
+    echo "1. Searching for Cortex policy assignment..."
+
+    local CORTEX_PATTERN="Cortex Policy cortex-"
+
+    ASSIGNMENT_JSON=$(az policy assignment list \
+        --scope "$MANAGEMENT_GROUP_SCOPE" \
+        --query "[?starts_with(displayName, '${CORTEX_PATTERN}')].[id, displayName]" \
+        --output tsv 2>/dev/null)
+
+    MATCH_COUNT=$(echo "$ASSIGNMENT_JSON" | grep -c '.' || true)
+
+    if [ "$MATCH_COUNT" -eq 0 ] || [ -z "$ASSIGNMENT_JSON" ]; then
+        echo -e "${RED}❌ ERROR: No Cortex policy assignment found.${NC}"
+        log_error "❌ Cortex policy assignment not found"
+        return 1
+    elif [ "$MATCH_COUNT" -gt 1 ]; then
+        echo -e "${YELLOW}⚠️ Multiple assignments found. Using first match.${NC}"
+    fi
+
+    ASSIGNMENT_ID=$(echo "$ASSIGNMENT_JSON" | head -1 | cut -f1)
+    ASSIGNMENT_NAME=$(echo "$ASSIGNMENT_JSON" | head -1 | cut -f2)
+
+    echo -e "   ${GREEN}→ Found:${NC} $ASSIGNMENT_NAME"
+    echo -e "   ${GREEN}→ ID:${NC}    $ASSIGNMENT_ID"
+    echo
+
+    # STEP 2: Compliance Check
+    echo "2. Checking compliance state..."
+
+    NON_COMPLIANT_RESOURCES=$(az policy state list \
+        --management-group "$MANAGEMENT_GROUP_ID" \
+        --filter "policyAssignmentId eq '$ASSIGNMENT_ID'" \
+        --query "[?complianceState=='NonCompliant'].resourceId" \
+        --output tsv 2>/dev/null)
+
+    # STEP 3: Decision Logic
+    if [ -z "$NON_COMPLIANT_RESOURCES" ]; then
+        echo
+        echo -e "${GREEN}✅ STATUS: Compliant${NC}"
+        echo "No further action required."
+        return 0
+    fi
+
+    NON_COMPLIANT_COUNT=$(echo "$NON_COMPLIANT_RESOURCES" | wc -l)
+
+    echo
+    echo -e "${RED}❌ STATUS: Non-compliant${NC}"
+    echo "   → Found $NON_COMPLIANT_COUNT resource(s)"
+    echo
+
+    echo "3. Creating remediation task..."
+
+    REMEDIATION_NAME="cortex-rem-$(date +%s)"
+
+    az policy remediation create \
+        --management-group "$MANAGEMENT_GROUP_ID" \
+        --name "$REMEDIATION_NAME" \
+        --policy-assignment "$ASSIGNMENT_ID" \
+        --output table
+
+    if [ $? -eq 0 ]; then
+        echo
+        echo -e "${GREEN}✅ SUCCESS:${NC} Remediation '$REMEDIATION_NAME' triggered"
+    else
+        echo -e "${RED}❌ ERROR: Failed to create remediation task${NC}"
+        log_error "❌ Remediation creation failed"
+        return 1
+    fi
+}
+
 azure_subscription_check() {
+    echo
+    print_header "Azure Management Group Input"
+    echo
+
+    # Prompt only if not already set
+    if [ -z "$MANAGEMENT_GROUP_ID" ]; then
+        read -rp "Enter Management Group ID: " MANAGEMENT_GROUP_ID
+    fi
+
+    # Trim whitespace
+    MANAGEMENT_GROUP_ID="$(echo "$MANAGEMENT_GROUP_ID" | xargs)"
+
+    # Validate empty
+    if [ -z "$MANAGEMENT_GROUP_ID" ]; then
+        echo -e "${RED}❌ ERROR: Management Group ID cannot be empty.${NC}"
+        log_error "❌ Empty MANAGEMENT_GROUP_ID"
+        HAS_ERRORS=true
+        ERRORS+=("Management Group ID not provided")
+
+    fi
+
+    # Validate format
+    if [[ ! "$MANAGEMENT_GROUP_ID" =~ ^[a-zA-Z0-9._()-]+$ ]]; then
+        echo -e "${RED}❌ ERROR: Invalid Management Group ID format.${NC}"
+        log_error "❌ Invalid MANAGEMENT_GROUP_ID format"
+        HAS_ERRORS=true
+        ERRORS+=("Invalid Management Group ID format")
+
+    fi
+
+    # Validate existence in Azure
+    if ! az account management-group show --name "$MANAGEMENT_GROUP_ID" -o none 2>/dev/null; then
+        echo -e "${RED}❌ ERROR: Management Group '$MANAGEMENT_GROUP_ID' does not exist or you lack permissions.${NC}"
+        log_error "❌ Invalid or inaccessible MG: $MANAGEMENT_GROUP_ID"
+        HAS_ERRORS=true
+        ERRORS+=("Management Group not found or inaccessible")
+
+    fi
+
+    azure_management_group_policy_check
+
+    if [ $? -ne 0 ]; then
+        HAS_ERRORS=true
+        ERRORS+=("❌ Cortex Management Group Policy validation failed")
+    fi
+
     echo
     print_header "Starting Azure Resource Provider Registration Check"
     echo
+
+    echo -e "${YELLOW}NOTE:${NC} If you are utilizing the Terraform deployment method,
+    the Cortex templates will also attempt to automatically register
+    ${YELLOW}Microsoft.EventGrid${NC} and ${YELLOW}Microsoft.KeyVault${NC} as part of the core infrastructure provisioning."
+    echo
     # DOC: Reference - https://learn.microsoft.com/en-us/azure/azure-resource-manager/management/resource-providers-and-types
-    # providers needed to check list
+
+    # Required Azure Resource Providers
     local PROVIDERS_TO_CHECK=(
+        "Microsoft.Security"
         "Microsoft.Insights"
+        "Microsoft.Communication"
+        "Microsoft.Datadog"
+        "Microsoft.Aadiam"
     )
 
     # get the current subscription ID dynamically
     CURRENT_SUBSCRIPTION=$(az account show --query "id" --output tsv 2>/dev/null)
+
     if [ -z "$CURRENT_SUBSCRIPTION" ]; then
         echo "❌ ERROR: Unable to retrieve the current Azure subscription. Please run 'az login' and try again."
         log_error "❌ Unable to retrieve Azure subscription. Run 'az login' and try again."
@@ -630,7 +793,7 @@ azure_subscription_check() {
 
     echo "Using subscription: $CURRENT_SUBSCRIPTION"
     echo
-        
+
     az account set --subscription "$CURRENT_SUBSCRIPTION" 2>/dev/null
 
     if [ $? -ne 0 ]; then
@@ -648,27 +811,28 @@ azure_subscription_check() {
     # main Check Loop
     for provider in "${PROVIDERS_TO_CHECK[@]}"; do
         echo -n "Checking provider: $provider ... "
-        
-        # get the registration state. 
-        STATE=$(az provider show --namespace "$provider" --query "registrationState" --output tsv 2>/dev/null)
-        
-        # check the state and report
+
+        STATE=$(az provider show \
+            --namespace "$provider" \
+            --query "registrationState" \
+            --output tsv 2>/dev/null)
+
         if [ "$STATE" == "Registered" ]; then
             echo -e "${GREEN}✅ Registered${NC}"
-        
+
         elif [ "$STATE" == "Registering" ]; then
             echo -e "${YELLOW}⚠️  Registering${NC}"
             echo -e "   ${YELLOW}-> This provider is still registering. Please wait 5–15 minutes and re-run this check.${NC}"
             ALL_CHECKS_PASSED=false
             FAILED_PROVIDERS+=("$provider (Status: Registering)")
-            
+
         elif [ "$STATE" == "NotRegistered" ] || [ "$STATE" == "Unregistered" ]; then
             echo -e "${RED}❌ Not Registered${NC}"
-            echo -e "   ${YELLOW}-> SOLUTION:${NC} This provider is required. Run the following command:"
+            echo -e "   ${YELLOW}-> SOLUTION:${NC} This provider is required. Run:"
             echo -e "      ${BOLD}az provider register --namespace $provider --subscription $CURRENT_SUBSCRIPTION${NC}"
             ALL_CHECKS_PASSED=false
             FAILED_PROVIDERS+=("$provider (Status: Not Registered)")
-            
+
         else
             echo -e "${RED}❓ Unknown State:${NC} $STATE"
             echo "   -> An unexpected status was returned. Please check in the Azure Portal."
@@ -677,23 +841,25 @@ azure_subscription_check() {
         fi
     done
 
-    # report
+    # Final report
+    echo
     if [ "$ALL_CHECKS_PASSED" == "true" ]; then
         echo -e "${GREEN}🎉 SUCCESS:${NC} All required providers are registered."
-        
+
     else
-        echo ""
-        echo -e "${RED}🔴 FAILED: The following providers need attention:"
-        # Loop through the failure list
+        echo -e "${RED}🔴 FAILED: The following providers need attention:${NC}"
+
         for p in "${FAILED_PROVIDERS[@]}"; do
             echo -e "   - ${YELLOW}$p${NC}"
         done
-        
-        echo ""
-        echo -e "   ${YELLOW}After fixing, re-run this script to confirm.${NC}"
+
+        echo
+        echo -e "${YELLOW}After fixing, re-run this script to confirm.${NC}"
+
         log_error "❌ Provider check failed for: ${FAILED_PROVIDERS[*]}"
     fi
-    #end of resource providers check
+
+    # end of resource providers check
 
     echo
     print_header "Starting Azure Conditional Access Policy Check"
@@ -981,16 +1147,73 @@ azure_subscription_check() {
 }
 azure_management_group_check() {
     echo
+    print_header "Azure Management Group Input"
+    echo
+
+    # Prompt only if not already set
+    if [ -z "$MANAGEMENT_GROUP_ID" ]; then
+        read -rp "Enter Management Group ID: " MANAGEMENT_GROUP_ID
+    fi
+
+    # Trim whitespace
+    MANAGEMENT_GROUP_ID="$(echo "$MANAGEMENT_GROUP_ID" | xargs)"
+
+    # Validate empty
+    if [ -z "$MANAGEMENT_GROUP_ID" ]; then
+        echo -e "${RED}❌ ERROR: Management Group ID cannot be empty.${NC}"
+        log_error "❌ Empty MANAGEMENT_GROUP_ID"
+        HAS_ERRORS=true
+        ERRORS+=("Management Group ID not provided")
+
+    fi
+
+    # Validate format
+    if [[ ! "$MANAGEMENT_GROUP_ID" =~ ^[a-zA-Z0-9._()-]+$ ]]; then
+        echo -e "${RED}❌ ERROR: Invalid Management Group ID format.${NC}"
+        log_error "❌ Invalid MANAGEMENT_GROUP_ID format"
+        HAS_ERRORS=true
+        ERRORS+=("Invalid Management Group ID format")
+
+    fi
+
+    # Validate existence in Azure
+    if ! az account management-group show --name "$MANAGEMENT_GROUP_ID" -o none 2>/dev/null; then
+        echo -e "${RED}❌ ERROR: Management Group '$MANAGEMENT_GROUP_ID' does not exist or you lack permissions.${NC}"
+        log_error "❌ Invalid or inaccessible MG: $MANAGEMENT_GROUP_ID"
+        HAS_ERRORS=true
+        ERRORS+=("Management Group not found or inaccessible")
+
+    fi
+
+    azure_management_group_policy_check
+
+    if [ $? -ne 0 ]; then
+        HAS_ERRORS=true
+        ERRORS+=("❌ Cortex Management Group Policy validation failed")
+    fi
+
+    echo
     print_header "Starting Azure Resource Provider Registration Check"
     echo
+
+    echo -e "${YELLOW}NOTE:${NC} If you are utilizing the Terraform deployment method,
+    the Cortex templates will also attempt to automatically register
+    ${YELLOW}Microsoft.EventGrid${NC} and ${YELLOW}Microsoft.KeyVault${NC} as part of the core infrastructure provisioning."
+    echo
     # DOC: Reference - https://learn.microsoft.com/en-us/azure/azure-resource-manager/management/resource-providers-and-types
-    # providers needed to check list
+
+    # Required Azure Resource Providers
     local PROVIDERS_TO_CHECK=(
+        "Microsoft.Security"
         "Microsoft.Insights"
+        "Microsoft.Communication"
+        "Microsoft.Datadog"
+        "Microsoft.Aadiam"
     )
 
     # get the current subscription ID dynamically
     CURRENT_SUBSCRIPTION=$(az account show --query "id" --output tsv 2>/dev/null)
+
     if [ -z "$CURRENT_SUBSCRIPTION" ]; then
         echo "❌ ERROR: Unable to retrieve the current Azure subscription. Please run 'az login' and try again."
         log_error "❌ Unable to retrieve Azure subscription. Run 'az login' and try again."
@@ -999,7 +1222,7 @@ azure_management_group_check() {
 
     echo "Using subscription: $CURRENT_SUBSCRIPTION"
     echo
-        
+
     az account set --subscription "$CURRENT_SUBSCRIPTION" 2>/dev/null
 
     if [ $? -ne 0 ]; then
@@ -1017,27 +1240,28 @@ azure_management_group_check() {
     # main Check Loop
     for provider in "${PROVIDERS_TO_CHECK[@]}"; do
         echo -n "Checking provider: $provider ... "
-        
-        # get the registration state. 
-        STATE=$(az provider show --namespace "$provider" --query "registrationState" --output tsv 2>/dev/null)
-        
-        # check the state and report
+
+        STATE=$(az provider show \
+            --namespace "$provider" \
+            --query "registrationState" \
+            --output tsv 2>/dev/null)
+
         if [ "$STATE" == "Registered" ]; then
             echo -e "${GREEN}✅ Registered${NC}"
-        
+
         elif [ "$STATE" == "Registering" ]; then
             echo -e "${YELLOW}⚠️  Registering${NC}"
             echo -e "   ${YELLOW}-> This provider is still registering. Please wait 5–15 minutes and re-run this check.${NC}"
             ALL_CHECKS_PASSED=false
             FAILED_PROVIDERS+=("$provider (Status: Registering)")
-            
+
         elif [ "$STATE" == "NotRegistered" ] || [ "$STATE" == "Unregistered" ]; then
             echo -e "${RED}❌ Not Registered${NC}"
-            echo -e "   ${YELLOW}-> SOLUTION:${NC} This provider is required. Run the following command:"
+            echo -e "   ${YELLOW}-> SOLUTION:${NC} This provider is required. Run:"
             echo -e "      ${BOLD}az provider register --namespace $provider --subscription $CURRENT_SUBSCRIPTION${NC}"
             ALL_CHECKS_PASSED=false
             FAILED_PROVIDERS+=("$provider (Status: Not Registered)")
-            
+
         else
             echo -e "${RED}❓ Unknown State:${NC} $STATE"
             echo "   -> An unexpected status was returned. Please check in the Azure Portal."
@@ -1046,23 +1270,25 @@ azure_management_group_check() {
         fi
     done
 
-    # report
+    # Final report
+    echo
     if [ "$ALL_CHECKS_PASSED" == "true" ]; then
         echo -e "${GREEN}🎉 SUCCESS:${NC} All required providers are registered."
-        
+
     else
-        echo ""
-        echo -e "${RED}🔴 FAILED: The following providers need attention:"
-        # Loop through the failure list
+        echo -e "${RED}🔴 FAILED: The following providers need attention:${NC}"
+
         for p in "${FAILED_PROVIDERS[@]}"; do
             echo -e "   - ${YELLOW}$p${NC}"
         done
-        
-        echo ""
-        echo -e "   ${YELLOW}After fixing, re-run this script to confirm.${NC}"
+
+        echo
+        echo -e "${YELLOW}After fixing, re-run this script to confirm.${NC}"
+
         log_error "❌ Provider check failed for: ${FAILED_PROVIDERS[*]}"
     fi
-    #end of resource providers check
+
+    # end of resource providers check
 
     echo
     print_header "Starting Azure Conditional Access Policy Check"
@@ -1217,35 +1443,9 @@ azure_management_group_check() {
     command -v jq >/dev/null || { echo "jq not found (Cloud Shell usually has it)" >&2; return 2; }
 
     # management group scope
-    local MG_ID MG_SCOPE ASSIGNEE
+    local MG_SCOPE ASSIGNEE
 
-    # Keep asking until we get an existing MG
-    while true; do
-
-        MG_ID="${AZURE_MG_ID:-$MG_ID}"  # preserve if user already typed something
-
-        if [[ -z "$MG_ID" ]]; then
-            read -rp "Enter Management Group ID: " MG_ID
-        fi
-
-        if [[ -z "$MG_ID" ]]; then
-            echo "❌ Empty Management Group ID. Please try again." >&2
-            continue
-        fi
-
-        # Validate MG existence
-        if ! az account management-group show --name "$MG_ID" -o none 2>/dev/null; then
-            echo "❌ '$MG_ID' does not exist or you do not have permissions to view it." >&2
-            echo "Please enter an existing Management Group ID."
-            MG_ID=""   # clear to re-ask
-            continue
-        fi
-
-        # At this point the MG is valid
-        break
-    done
-
-    MG_SCOPE="/providers/Microsoft.Management/managementGroups/${MG_ID}"
+    MG_SCOPE="/providers/Microsoft.Management/managementGroups/${MANAGEMENT_GROUP_ID}"
 
     # current principal (objectId if possible, else UPN)
     ASSIGNEE="$(az ad signed-in-user show --query id -o tsv 2>/dev/null || true)"
@@ -1308,7 +1508,7 @@ azure_management_group_check() {
     _ci_match() { local pat="${1,,}" str="${2,,}"; [[ $str == $pat ]]; }
 
     _is_mg_root() {
-        local s="${1,,}" mg="/providers/microsoft.management/managementgroups/${MG_ID,,}"
+        local s="${1,,}" mg="/providers/microsoft.management/managementgroups/${MANAGEMENT_GROUP_ID,,}"
         [[ "$s" == "$mg" ]]
     }
 
@@ -1343,7 +1543,7 @@ azure_management_group_check() {
             IFS='|' read -r scope action <<<"$entry"
             _is_mg_root "$scope" && _ci_match "$action" "$req" && return 0
         done
-        return 1
+
     }
 
     # ask which feature sets to include
@@ -1426,16 +1626,73 @@ azure_management_group_check() {
 }
 azure_tenant_check() {
     echo
+    print_header "Azure Management Group Input"
+    echo
+
+    # Prompt only if not already set
+    if [ -z "$MANAGEMENT_GROUP_ID" ]; then
+        read -rp "Enter Management Group ID: " MANAGEMENT_GROUP_ID
+    fi
+
+    # Trim whitespace
+    MANAGEMENT_GROUP_ID="$(echo "$MANAGEMENT_GROUP_ID" | xargs)"
+
+    # Validate empty
+    if [ -z "$MANAGEMENT_GROUP_ID" ]; then
+        echo -e "${RED}❌ ERROR: Management Group ID cannot be empty.${NC}"
+        log_error "❌ Empty MANAGEMENT_GROUP_ID"
+        HAS_ERRORS=true
+        ERRORS+=("Management Group ID not provided")
+
+    fi
+
+    # Validate format
+    if [[ ! "$MANAGEMENT_GROUP_ID" =~ ^[a-zA-Z0-9._()-]+$ ]]; then
+        echo -e "${RED}❌ ERROR: Invalid Management Group ID format.${NC}"
+        log_error "❌ Invalid MANAGEMENT_GROUP_ID format"
+        HAS_ERRORS=true
+        ERRORS+=("Invalid Management Group ID format")
+
+    fi
+
+    # Validate existence in Azure
+    if ! az account management-group show --name "$MANAGEMENT_GROUP_ID" -o none 2>/dev/null; then
+        echo -e "${RED}❌ ERROR: Management Group '$MANAGEMENT_GROUP_ID' does not exist or you lack permissions.${NC}"
+        log_error "❌ Invalid or inaccessible MG: $MANAGEMENT_GROUP_ID"
+        HAS_ERRORS=true
+        ERRORS+=("Management Group not found or inaccessible")
+
+    fi
+
+    azure_management_group_policy_check
+
+    if [ $? -ne 0 ]; then
+        HAS_ERRORS=true
+        ERRORS+=("❌ Cortex Management Group Policy validation failed")
+    fi
+
+    echo
     print_header "Starting Azure Resource Provider Registration Check"
     echo
+
+    echo -e "${YELLOW}NOTE:${NC} If you are utilizing the Terraform deployment method,
+    the Cortex templates will also attempt to automatically register
+    ${YELLOW}Microsoft.EventGrid${NC} and ${YELLOW}Microsoft.KeyVault${NC} as part of the core infrastructure provisioning."
+    echo
     # DOC: Reference - https://learn.microsoft.com/en-us/azure/azure-resource-manager/management/resource-providers-and-types
-    # providers needed to check list
+
+    # Required Azure Resource Providers
     local PROVIDERS_TO_CHECK=(
+        "Microsoft.Security"
         "Microsoft.Insights"
+        "Microsoft.Communication"
+        "Microsoft.Datadog"
+        "Microsoft.Aadiam"
     )
 
     # get the current subscription ID dynamically
     CURRENT_SUBSCRIPTION=$(az account show --query "id" --output tsv 2>/dev/null)
+
     if [ -z "$CURRENT_SUBSCRIPTION" ]; then
         echo "❌ ERROR: Unable to retrieve the current Azure subscription. Please run 'az login' and try again."
         log_error "❌ Unable to retrieve Azure subscription. Run 'az login' and try again."
@@ -1462,27 +1719,28 @@ azure_tenant_check() {
     # main Check Loop
     for provider in "${PROVIDERS_TO_CHECK[@]}"; do
         echo -n "Checking provider: $provider ... "
-        
-        # get the registration state. 
-        STATE=$(az provider show --namespace "$provider" --query "registrationState" --output tsv 2>/dev/null)
-        
-        # check the state and report
+
+        STATE=$(az provider show \
+            --namespace "$provider" \
+            --query "registrationState" \
+            --output tsv 2>/dev/null)
+
         if [ "$STATE" == "Registered" ]; then
             echo -e "${GREEN}✅ Registered${NC}"
-        
+
         elif [ "$STATE" == "Registering" ]; then
             echo -e "${YELLOW}⚠️  Registering${NC}"
             echo -e "   ${YELLOW}-> This provider is still registering. Please wait 5–15 minutes and re-run this check.${NC}"
             ALL_CHECKS_PASSED=false
             FAILED_PROVIDERS+=("$provider (Status: Registering)")
-            
+
         elif [ "$STATE" == "NotRegistered" ] || [ "$STATE" == "Unregistered" ]; then
             echo -e "${RED}❌ Not Registered${NC}"
-            echo -e "   ${YELLOW}-> SOLUTION:${NC} This provider is required. Run the following command:"
+            echo -e "   ${YELLOW}-> SOLUTION:${NC} This provider is required. Run:"
             echo -e "      ${BOLD}az provider register --namespace $provider --subscription $CURRENT_SUBSCRIPTION${NC}"
             ALL_CHECKS_PASSED=false
             FAILED_PROVIDERS+=("$provider (Status: Not Registered)")
-            
+
         else
             echo -e "${RED}❓ Unknown State:${NC} $STATE"
             echo "   -> An unexpected status was returned. Please check in the Azure Portal."
@@ -1491,23 +1749,26 @@ azure_tenant_check() {
         fi
     done
 
-    # report
+    # Final report
+    echo
     if [ "$ALL_CHECKS_PASSED" == "true" ]; then
         echo -e "${GREEN}🎉 SUCCESS:${NC} All required providers are registered."
-        
+
     else
-        echo ""
-        echo -e "${RED}🔴 FAILED: The following providers need attention:"
-        # Loop through the failure list
+        echo -e "${RED}🔴 FAILED: The following providers need attention:${NC}"
+
         for p in "${FAILED_PROVIDERS[@]}"; do
             echo -e "   - ${YELLOW}$p${NC}"
         done
-        
-        echo ""
-        echo -e "   ${YELLOW}After fixing, re-run this script to confirm.${NC}"
+
+        echo
+        echo -e "${YELLOW}After fixing, re-run this script to confirm.${NC}"
+
         log_error "❌ Provider check failed for: ${FAILED_PROVIDERS[*]}"
     fi
-    #end of resource providers check
+
+    # end of resource providers check
+
 
     echo
     print_header "Starting Azure Conditional Access Policy Check"
@@ -1760,6 +2021,7 @@ azure_tenant_check() {
         say "${YELLOW}\n1. **Azure RBAC Roles (Required Minimum):** Your user must have at least the **'Contributor'** role assigned at the **Subscription** *and* **Management Group** level.${NC}"
         say "${YELLOW}\n2. **Tenant Root Scope Access:** You must have an Azure RBAC role (e.g., 'Reader' or 'User Access Administrator') assigned at the **Tenant Root Scope ('/')**. This is the level *above* all subscriptions.${NC}"
         say "${YELLOW}\n3. **Microsoft Entra ID Role (If initial setup is needed):** A **'Global Administrator'** role in Microsoft Entra ID may be required for the initial one-time enablement of Management Groups for the directory.${NC}"
+        log_error "Root Management Group not found or inaccessible. Unable to validate tenant root scope permissions."
         # return 2  # uncomment to fail hard
     else
         echo "Root management group: $ROOTMG"
@@ -1786,6 +2048,7 @@ azure_tenant_check() {
 
         if [[ -z "$OBJECT_ID" ]]; then
             echo -e "${YELLOW}Skipping tenant-level role check: Cannot resolve signed-in user's object id.${NC}" >&2
+            log_error "Unable to resolve the signed-in user's object id. Tenant root scope role check was skipped."
         else
             local TENANT_ROLES_JSON
             TENANT_ROLES_JSON="$(az role assignment list \
@@ -1802,6 +2065,7 @@ azure_tenant_check() {
             else
                 echo -e "Result: ${RED}User does NOT have 'Owner' or 'Contributor' assignment at the tenant root scope ('/').${NC}"
                 echo "Action: An existing user with sufficient privileges must assign 'Owner' or 'Contributor' to '${UPN:-this user}' at the tenant root scope."
+                log_error "Missing 'Owner' or 'Contributor' assignment at the tenant root scope ('/') for ${UPN:-this user}."
             fi
         fi
     fi
