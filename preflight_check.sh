@@ -71,13 +71,25 @@ EOF
 }
 # Case-insensitive glob match: _ci_match <pattern> <value>
 _ci_match() {
-  local pat="${1,,}" str="${2,,}"
-  [[ "$str" == $pat ]]   # pat unquoted on purpose to allow globs like */register/action
+    local pat str
+    pat="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+    str="$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')"
+    [[ "$str" == $pat ]]
 }
 
 # Break-word for big infos
 say() {
   echo -e "$@" | fold -s -w 75
+}
+
+read_lines_into_array() {
+    local __array_name="$1"
+    local __line
+    eval "$__array_name=()"
+
+    while IFS= read -r __line; do
+        [ -n "$__line" ] && eval "$__array_name+=(\"\$__line\")"
+    done
 }
 
 # Permission Sets for AWS Accounts
@@ -250,7 +262,6 @@ PERMISSIONS_AZURE_MG_BASE=(
     "Microsoft.Resources/deployments/operations/read"
     "Microsoft.Resources/deployments/exportTemplate/action"
     "Microsoft.Resources/deployments/operationstatuses/read"
-    "Microsoft.Authorization/elevateAccess/action"
     "Microsoft.PolicyInsights/remediations/read"
     "Microsoft.PolicyInsights/remediations/write"
     "Microsoft.PolicyInsights/remediations/delete"
@@ -275,15 +286,15 @@ PERMISSIONS_AZURE_MG_BASE=(
     "Microsoft.ManagedIdentity/userAssignedIdentities/assign/action"
     "Microsoft.Management/managementGroups/descendants/read"
     "Microsoft.Management/managementGroups/subscriptions/read"
-    "Microsoft.Resources/deployments/*",
-    "Microsoft.Resources/subscriptions/resourceGroups/*",
-    "Microsoft.Resources/subscriptions/read",
-    "Microsoft.Authorization/roleDefinitions/*",
-    "Microsoft.Authorization/roleAssignments/*",
-    "Microsoft.Authorization/policyDefinitions/*",
-    "Microsoft.Authorization/policyAssignments/*",
-    "Microsoft.EventHub/namespaces/*",
-    "Microsoft.Insights/diagnosticSettings/*",
+    "Microsoft.Resources/deployments/*"
+    "Microsoft.Resources/subscriptions/resourceGroups/*"
+    "Microsoft.Resources/subscriptions/read"
+    "Microsoft.Authorization/roleDefinitions/*"
+    "Microsoft.Authorization/roleAssignments/*"
+    "Microsoft.Authorization/policyDefinitions/*"
+    "Microsoft.Authorization/policyAssignments/*"
+    "Microsoft.EventHub/namespaces/*"
+    "Microsoft.Insights/diagnosticSettings/*"
     "Microsoft.Compute/galleries/*"
 )
 PERMISSIONS_AZURE_MG_AUDIT_LOGS=(
@@ -1045,19 +1056,19 @@ azure_subscription_check() {
         local role
         role="$(jq -c --arg rid "$rid" '.[] | select(.id==$rid or .name==$rid)' <<<"$roles_json")"
         [[ -z "$role" ]] && continue
-        mapfile -t _a   < <(jq -r '.permissions[]?.actions[]?'         <<<"$role")
-        mapfile -t _na  < <(jq -r '.permissions[]?.notActions[]?'      <<<"$role")
-        mapfile -t _da  < <(jq -r '.permissions[]?.dataActions[]?'     <<<"$role")
-        mapfile -t _nda < <(jq -r '.permissions[]?.notDataActions[]?'  <<<"$role")
+        read_lines_into_array _a   < <(jq -r '.permissions[]?.actions[]?'         <<<"$role")
+        read_lines_into_array _na  < <(jq -r '.permissions[]?.notActions[]?'      <<<"$role")
+        read_lines_into_array _da  < <(jq -r '.permissions[]?.dataActions[]?'     <<<"$role")
+        read_lines_into_array _nda < <(jq -r '.permissions[]?.notDataActions[]?'  <<<"$role")
         EFFECTIVE_ACTIONS+=("${_a[@]}");   EFFECTIVE_NOTACTIONS+=("${_na[@]}")
         EFFECTIVE_DATAACTIONS+=("${_da[@]}"); EFFECTIVE_NOTDATAACTIONS+=("${_nda[@]}")
     done <<<"$role_ids"
 
     # de-dup
-    mapfile -t EFFECTIVE_ACTIONS        < <(printf "%s\n" "${EFFECTIVE_ACTIONS[@]}"        | awk 'NF' | sort -u)
-    mapfile -t EFFECTIVE_NOTACTIONS     < <(printf "%s\n" "${EFFECTIVE_NOTACTIONS[@]}"     | awk 'NF' | sort -u)
-    mapfile -t EFFECTIVE_DATAACTIONS    < <(printf "%s\n" "${EFFECTIVE_DATAACTIONS[@]}"    | awk 'NF' | sort -u)
-    mapfile -t EFFECTIVE_NOTDATAACTIONS < <(printf "%s\n" "${EFFECTIVE_NOTDATAACTIONS[@]}" | awk 'NF' | sort -u)
+    read_lines_into_array EFFECTIVE_ACTIONS        < <(printf "%s\n" "${EFFECTIVE_ACTIONS[@]}"        | awk 'NF' | sort -u)
+    read_lines_into_array EFFECTIVE_NOTACTIONS     < <(printf "%s\n" "${EFFECTIVE_NOTACTIONS[@]}"     | awk 'NF' | sort -u)
+    read_lines_into_array EFFECTIVE_DATAACTIONS    < <(printf "%s\n" "${EFFECTIVE_DATAACTIONS[@]}"    | awk 'NF' | sort -u)
+    read_lines_into_array EFFECTIVE_NOTDATAACTIONS < <(printf "%s\n" "${EFFECTIVE_NOTDATAACTIONS[@]}" | awk 'NF' | sort -u)
 
     # wildcard matcher: allow patterns like Microsoft.*/*/read
     _match() { local pat="$1" str="$2"; [[ "$str" == $pat ]]; }
@@ -1121,7 +1132,7 @@ azure_subscription_check() {
         return 0
     else
         echo -e "${GREEN}You have the following required actions:"
-        mapfile -t DIF < <(printf '%s\n' "${azure_single_actions[@]}" \
+        read_lines_into_array DIF < <(printf '%s\n' "${azure_single_actions[@]}" \
         | grep -Fxv -f <(printf '%s\n' "${missing[@]}"))
         printf '%s\n' "${DIF[@]}"
         echo
@@ -1487,10 +1498,10 @@ azure_management_group_check() {
 
         [[ -z "$role" ]] && continue
 
-        mapfile -t _a   < <(jq -r '.permissions[]?.actions[]?'        <<<"$role")
-        mapfile -t _na  < <(jq -r '.permissions[]?.notActions[]?'     <<<"$role")
-        mapfile -t _da  < <(jq -r '.permissions[]?.dataActions[]?'    <<<"$role")
-        mapfile -t _nda < <(jq -r '.permissions[]?.notDataActions[]?' <<<"$role")
+        read_lines_into_array _a   < <(jq -r '.permissions[]?.actions[]?'        <<<"$role")
+        read_lines_into_array _na  < <(jq -r '.permissions[]?.notActions[]?'     <<<"$role")
+        read_lines_into_array _da  < <(jq -r '.permissions[]?.dataActions[]?'    <<<"$role")
+        read_lines_into_array _nda < <(jq -r '.permissions[]?.notDataActions[]?' <<<"$role")
 
         EFFECTIVE_ACTIONS+=("${_a[@]}")
         EFFECTIVE_NOTACTIONS+=("${_na[@]}")
@@ -1499,19 +1510,17 @@ azure_management_group_check() {
     done <<<"$role_ids"
 
     # Deduplicate all sets
-    mapfile -t EFFECTIVE_ACTIONS        < <(printf "%s\n" "${EFFECTIVE_ACTIONS[@]}"        | awk 'NF' | sort -u)
-    mapfile -t EFFECTIVE_NOTACTIONS     < <(printf "%s\n" "${EFFECTIVE_NOTACTIONS[@]}"     | awk 'NF' | sort -u)
-    mapfile -t EFFECTIVE_DATAACTIONS    < <(printf "%s\n" "${EFFECTIVE_DATAACTIONS[@]}"    | awk 'NF' | sort -u)
-    mapfile -t EFFECTIVE_NOTDATAACTIONS < <(printf "%s\n" "${EFFECTIVE_NOTDATAACTIONS[@]}" | awk 'NF' | sort -u)
-
-    # helpers
-    _ci_match() { local pat="${1,,}" str="${2,,}"; [[ $str == $pat ]]; }
+    read_lines_into_array EFFECTIVE_ACTIONS        < <(printf "%s\n" "${EFFECTIVE_ACTIONS[@]}"        | awk 'NF' | sort -u)
+    read_lines_into_array EFFECTIVE_NOTACTIONS     < <(printf "%s\n" "${EFFECTIVE_NOTACTIONS[@]}"     | awk 'NF' | sort -u)
+    read_lines_into_array EFFECTIVE_DATAACTIONS    < <(printf "%s\n" "${EFFECTIVE_DATAACTIONS[@]}"    | awk 'NF' | sort -u)
+    read_lines_into_array EFFECTIVE_NOTDATAACTIONS < <(printf "%s\n" "${EFFECTIVE_NOTDATAACTIONS[@]}" | awk 'NF' | sort -u)
 
     _is_mg_root() {
-        local s="${1,,}" mg="/providers/microsoft.management/managementgroups/${MANAGEMENT_GROUP_ID,,}"
+        local s mg
+        s="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+        mg="/providers/microsoft.management/managementgroups/$(printf '%s' "$MANAGEMENT_GROUP_ID" | tr '[:upper:]' '[:lower:]')"
         [[ "$s" == "$mg" ]]
     }
-
     # Deny assignments at MG scope (can block even if a role allows)
     local denies
     denies="$(
@@ -1523,27 +1532,62 @@ azure_management_group_check() {
     declare -a EFFECTIVE_DENY_ACTIONS_SCOPED=()
     declare -a EFFECTIVE_DENY_DATAACTIONS_SCOPED=()
 
-    mapfile -t EFFECTIVE_DENY_ACTIONS_SCOPED < <(
-        jq -r '.value[]? | select(.properties.scope!=null)
-                | "\(.properties.scope)|\(.properties.permissions[]?.denyActions[]?)"' <<<"$denies"
+    # Only include deny assignments that actually apply to the current assignee.
+    # This prevents unrelated Azure/system/managed-app deny assignments from falsely blocking this user.
+    read_lines_into_array EFFECTIVE_DENY_ACTIONS_SCOPED < <(
+        jq -r --arg assignee "$ASSIGNEE" '
+            .value[]?
+            | select(.properties.scope != null)
+            | select(
+                (
+                    [.properties.principals[]?.id] | index($assignee)
+                )
+                or
+                (
+                    [.properties.principals[]?.id] | index("00000000-0000-0000-0000-000000000000")
+                )
+            )
+            | select(
+                ([.properties.excludePrincipals[]?.id] | index($assignee)) | not
+            )
+            | "\(.properties.scope)|\(.properties.permissions[]?.denyActions[]?)"
+        ' <<<"$denies"
     )
 
-    mapfile -t EFFECTIVE_DENY_DATAACTIONS_SCOPED < <(
-        jq -r '.value[]? | select(.properties.scope!=null)
-                | "\(.properties.scope)|\(.properties.permissions[]?.denyDataActions[]?)"' <<<"$denies"
+    read_lines_into_array EFFECTIVE_DENY_DATAACTIONS_SCOPED < <(
+        jq -r --arg assignee "$ASSIGNEE" '
+            .value[]?
+            | select(.properties.scope != null)
+            | select(
+                (
+                    [.properties.principals[]?.id] | index($assignee)
+                )
+                or
+                (
+                    [.properties.principals[]?.id] | index("00000000-0000-0000-0000-000000000000")
+                )
+            )
+            | select(
+                ([.properties.excludePrincipals[]?.id] | index($assignee)) | not
+            )
+            | "\(.properties.scope)|\(.properties.permissions[]?.denyDataActions[]?)"
+        ' <<<"$denies"
     )
 
     _blocked_at_mg() {
         local req="$1" entry scope action
+
         for entry in "${EFFECTIVE_DENY_ACTIONS_SCOPED[@]}"; do
             IFS='|' read -r scope action <<<"$entry"
             _is_mg_root "$scope" && _ci_match "$action" "$req" && return 0
         done
+
         for entry in "${EFFECTIVE_DENY_DATAACTIONS_SCOPED[@]}"; do
             IFS='|' read -r scope action <<<"$entry"
             _is_mg_root "$scope" && _ci_match "$action" "$req" && return 0
         done
 
+        return 1
     }
 
     # ask which feature sets to include
@@ -1557,7 +1601,7 @@ azure_management_group_check() {
     esac
 
     # de-dup required
-    mapfile -t azure_mg_required < <(printf "%s\n" "${azure_mg_required[@]}" | awk 'NF' | sort -u)
+    read_lines_into_array azure_mg_required < <(printf "%s\n" "${azure_mg_required[@]}" | awk 'NF' | sort -u)
 
     # evaluate
     local missing=()
@@ -1600,7 +1644,6 @@ azure_management_group_check() {
         echo
         echo -e "${GREEN}Permissions OK${NC} — all required entries for MG scope are satisfied."
         printf '  - %s\n' "${azure_mg_required[@]}"
-        return 0
     else
         (( audts == 0 )) && echo "" || echo "Make sure you have Global Administrator role assigned in Entra ID instance to onboard this Management Group in Cortex Cloud"
         echo
