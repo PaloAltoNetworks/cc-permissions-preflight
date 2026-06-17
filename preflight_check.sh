@@ -46,12 +46,70 @@ NC='\033[0m' # No Color
 BOLD='\033[1m'
 
 #handle Azure errors
+# Result buckets
+PASSES=()
+WARNINGS=()
 ERRORS=()
-HAS_ERRORS=false
+
+log_pass() {
+    PASSES+=("$1")
+}
+
+log_warning() {
+    WARNINGS+=("$1")
+}
 
 log_error() {
-    ERRORS+=("$1")
-    HAS_ERRORS=true
+    ERRS_MSG="$1"
+    ERRORS+=("$ERRS_MSG")
+}
+
+has_errors() {
+    [ "${#ERRORS[@]}" -gt 0 ]
+}
+
+print_final_summary() {
+    echo
+    print_header "Final Preflight Summary"
+    echo
+
+    if [ "${#ERRORS[@]}" -gt 0 ]; then
+        echo -e "${RED}Blocking failures:${NC}"
+        for err in "${ERRORS[@]}"; do
+            echo -e "  ❌ $err"
+        done
+        echo
+    fi
+
+    if [ "${#WARNINGS[@]}" -gt 0 ]; then
+        echo -e "${YELLOW}Warnings / advisory findings:${NC}"
+        for warn in "${WARNINGS[@]}"; do
+            echo -e "  ⚠️  $warn"
+        done
+        echo
+    fi
+
+    if [ "${#PASSES[@]}" -gt 0 ]; then
+        echo -e "${GREEN}Successful checks:${NC}"
+        for pass in "${PASSES[@]}"; do
+            echo -e "  ✅ $pass"
+        done
+        echo
+    fi
+
+    if has_errors; then
+        echo -e "${RED}🔴 VALIDATION FAILED:${NC} Required permissions are missing or a blocking prerequisite failed."
+        echo -e "${YELLOW}Please fix the blocking failures above and re-run the script.${NC}"
+        exit 1
+    fi
+
+    echo -e "${GREEN}✅ VALIDATION PASSED:${NC} Required permissions are present."
+
+    if [ "${#WARNINGS[@]}" -gt 0 ]; then
+        echo -e "${YELLOW}Review the warnings above before onboarding.${NC}"
+    fi
+
+    exit 0
 }
 
 #Utils
@@ -90,6 +148,34 @@ read_lines_into_array() {
     while IFS= read -r __line; do
         [ -n "$__line" ] && eval "$__array_name+=(\"\$__line\")"
     done
+}
+
+validate_azure_login() {
+    if ! command -v az >/dev/null 2>&1; then
+        echo -e "${RED}❌ Azure CLI not found.${NC}"
+        log_error "Azure CLI is not installed or not available in PATH."
+        return 1
+    fi
+
+    if ! command -v jq >/dev/null 2>&1; then
+        echo -e "${RED}❌ jq not found.${NC}"
+        log_error "jq is required but not installed."
+        return 1
+    fi
+
+    if ! az account show >/dev/null 2>&1; then
+        echo -e "${RED}❌ Not logged in to Azure.${NC}"
+        log_error "Azure CLI is not logged in. Run az login and try again."
+        return 1
+    fi
+
+    local sub_id tenant_id user_name
+    sub_id="$(az account show --query id -o tsv 2>/dev/null)"
+    tenant_id="$(az account show --query tenantId -o tsv 2>/dev/null)"
+    user_name="$(az account show --query user.name -o tsv 2>/dev/null)"
+
+    log_pass "Azure CLI login detected. User: $user_name, Tenant: $tenant_id, Subscription: $sub_id"
+    return 0
 }
 
 # Permission Sets for AWS Accounts
@@ -557,11 +643,14 @@ aws_organization_check() {
     echo "Are you enabling - Collect Audit Logs (CloudTrail)?"
     read -p "Enter your choice of yes or no (y or n): " audit_logs
     case $audit_logs in
-        y)
+        y|Y)
             aws_org_actions=("${PERMISSIONS_AWS_ORG_BASE[@]}" "${PERMISSIONS_AWS_ORG_AUDIT_LOGS[@]}")
             audts=1
             ;;
-        n)
+        n|N)
+            aws_org_actions=("${PERMISSIONS_AWS_ORG_BASE[@]}")
+            ;;
+        *)
             aws_org_actions=("${PERMISSIONS_AWS_ORG_BASE[@]}")
             ;;
     esac
@@ -575,11 +664,11 @@ aws_organization_check() {
     read -p "Enter your choice of yes or no (y or n): " aws_features
 
     case $aws_features in
-        y)
+        y|Y)
             aws_org_actions=("${aws_org_actions[@]}" "${PERMISSIONS_AWS_ORG_FEATURES[@]}")
             feats=1
             ;;
-        n)
+        n|N)
             ;;
     esac
 
@@ -632,48 +721,72 @@ aws_organization_check() {
     fi
 }
 
+validate_management_group_input() {
+    echo
+    print_header "Azure Management Group Input"
+    echo
+
+    if [ -z "$MANAGEMENT_GROUP_ID" ]; then
+        read -rp "Enter Management Group ID: " MANAGEMENT_GROUP_ID
+    fi
+
+    MANAGEMENT_GROUP_ID="$(echo "$MANAGEMENT_GROUP_ID" | xargs)"
+
+    if [ -z "$MANAGEMENT_GROUP_ID" ]; then
+        echo -e "${RED}❌ ERROR: Management Group ID cannot be empty.${NC}"
+        log_error "Management Group ID not provided."
+        return 1
+    fi
+
+    if [[ ! "$MANAGEMENT_GROUP_ID" =~ ^[a-zA-Z0-9._()-]+$ ]]; then
+        echo -e "${RED}❌ ERROR: Invalid Management Group ID format.${NC}"
+        log_error "Invalid Management Group ID format: $MANAGEMENT_GROUP_ID"
+        return 1
+    fi
+
+    if ! az account management-group show --name "$MANAGEMENT_GROUP_ID" -o none 2>/dev/null; then
+        echo -e "${RED}❌ ERROR: Management Group '$MANAGEMENT_GROUP_ID' does not exist or you lack permissions.${NC}"
+        log_error "Management Group '$MANAGEMENT_GROUP_ID' not found or inaccessible."
+        return 1
+    fi
+
+    log_pass "Management Group '$MANAGEMENT_GROUP_ID' exists and is accessible."
+    return 0
+}
+
 azure_management_group_policy_check() {
     echo
     print_header "Starting Azure Management Group Cortex Policy Validation"
     echo
 
-    # Input validation (align with your script style)
     if [ -z "$MANAGEMENT_GROUP_ID" ]; then
-        echo -e "${RED}❌ ERROR: MANAGEMENT_GROUP_ID is not set.${NC}"
-        echo "Usage: export MANAGEMENT_GROUP_ID=<your-mg-id>"
-        log_error "❌ Missing MANAGEMENT_GROUP_ID"
-        return 1
-    fi
-
-    if [ -z "${MANAGEMENT_GROUP_ID// /}" ]; then
-        echo -e "${RED}❌ ERROR: Management Group ID cannot be empty or whitespace.${NC}"
-        log_error "❌ Invalid MANAGEMENT_GROUP_ID"
-        return 1
+        echo -e "${YELLOW}⚠️ MANAGEMENT_GROUP_ID is not set. Skipping Cortex policy validation.${NC}"
+        log_warning "Skipped Cortex Management Group Policy validation because MANAGEMENT_GROUP_ID is not set."
+        return 0
     fi
 
     MANAGEMENT_GROUP_SCOPE="/providers/Microsoft.Management/managementGroups/${MANAGEMENT_GROUP_ID}"
 
     echo "Target Management Group: $MANAGEMENT_GROUP_ID"
     echo "--------------------------------------------------"
-
-    # STEP 1: Find Cortex Policy Assignment
     echo "1. Searching for Cortex policy assignment..."
-
-    local CORTEX_PATTERN="Cortex Policy cortex-"
 
     ASSIGNMENT_JSON=$(az policy assignment list \
         --scope "$MANAGEMENT_GROUP_SCOPE" \
-        --query "[?starts_with(displayName, '${CORTEX_PATTERN}')].[id, displayName]" \
+        --query "[?contains(displayName, 'Cortex')].[id, displayName]" \
         --output tsv 2>/dev/null)
 
     MATCH_COUNT=$(echo "$ASSIGNMENT_JSON" | grep -c '.' || true)
 
     if [ "$MATCH_COUNT" -eq 0 ] || [ -z "$ASSIGNMENT_JSON" ]; then
-        echo -e "${RED}❌ ERROR: No Cortex policy assignment found.${NC}"
-        log_error "❌ Cortex policy assignment not found"
-        return 1
-    elif [ "$MATCH_COUNT" -gt 1 ]; then
-        echo -e "${YELLOW}⚠️ Multiple assignments found. Using first match.${NC}"
+        echo -e "${YELLOW}⚠️ No Cortex policy assignment found.${NC}"
+        log_warning "Cortex policy assignment was not found at Management Group '$MANAGEMENT_GROUP_ID'. This may be expected before onboarding or before the Cortex policy assignment exists."
+        return 0
+    fi
+
+    if [ "$MATCH_COUNT" -gt 1 ]; then
+        echo -e "${YELLOW}⚠️ Multiple Cortex-like policy assignments found. Using first match for compliance check.${NC}"
+        log_warning "Multiple Cortex-like policy assignments found at Management Group '$MANAGEMENT_GROUP_ID'. Script used the first match."
     fi
 
     ASSIGNMENT_ID=$(echo "$ASSIGNMENT_JSON" | head -1 | cut -f1)
@@ -683,7 +796,6 @@ azure_management_group_policy_check() {
     echo -e "   ${GREEN}→ ID:${NC}    $ASSIGNMENT_ID"
     echo
 
-    # STEP 2: Compliance Check
     echo "2. Checking compliance state..."
 
     NON_COMPLIANT_RESOURCES=$(az policy state list \
@@ -692,99 +804,152 @@ azure_management_group_policy_check() {
         --query "[?complianceState=='NonCompliant'].resourceId" \
         --output tsv 2>/dev/null)
 
-    # STEP 3: Decision Logic
     if [ -z "$NON_COMPLIANT_RESOURCES" ]; then
-        echo
-        echo -e "${GREEN}✅ STATUS: Compliant${NC}"
-        echo "No further action required."
+        echo -e "${GREEN}✅ Cortex policy assignment is compliant.${NC}"
+        log_pass "Cortex policy assignment '$ASSIGNMENT_NAME' is compliant."
         return 0
     fi
 
-    NON_COMPLIANT_COUNT=$(echo "$NON_COMPLIANT_RESOURCES" | wc -l)
+    NON_COMPLIANT_COUNT=$(echo "$NON_COMPLIANT_RESOURCES" | wc -l | xargs)
 
+    echo -e "${YELLOW}⚠️ Cortex policy assignment is non-compliant.${NC}"
+    echo "   → Found $NON_COMPLIANT_COUNT non-compliant resource(s)"
     echo
-    echo -e "${RED}❌ STATUS: Non-compliant${NC}"
-    echo "   → Found $NON_COMPLIANT_COUNT resource(s)"
-    echo
+    echo "Non-compliant resources:"
+    echo "$NON_COMPLIANT_RESOURCES"
 
-    echo "3. Creating remediation task..."
+    log_warning "Cortex policy assignment '$ASSIGNMENT_NAME' has $NON_COMPLIANT_COUNT non-compliant resource(s). Remediation may be required, but this script is notify-only."
 
-    REMEDIATION_NAME="cortex-rem-$(date +%s)"
-
-    az policy remediation create \
-        --management-group "$MANAGEMENT_GROUP_ID" \
-        --name "$REMEDIATION_NAME" \
-        --policy-assignment "$ASSIGNMENT_ID" \
-        --output table
-
-    if [ $? -eq 0 ]; then
-        echo
-        echo -e "${GREEN}✅ SUCCESS:${NC} Remediation '$REMEDIATION_NAME' triggered"
-    else
-        echo -e "${RED}❌ ERROR: Failed to create remediation task${NC}"
-        log_error "❌ Remediation creation failed"
-        return 1
-    fi
+    return 0
 }
 
-azure_subscription_check() {
+azure_conditional_access_policy_check() {
     echo
-    print_header "Azure Management Group Input"
+    print_header "Starting Azure Conditional Access Policy Check"
     echo
 
-    # Prompt only if not already set
-    if [ -z "$MANAGEMENT_GROUP_ID" ]; then
-        read -rp "Enter Management Group ID: " MANAGEMENT_GROUP_ID
+    local GRAPH_URL="https://graph.microsoft.com/v1.0"
+    local GRAPH_RESOURCE="https://graph.microsoft.com"
+    local ARM_ID="797f4846-ba00-4fd7-ba43-dac1f87f440d"
+    local CLOUD_SHELL_ID="2233b157-f44d-4812-b777-036cdaf9a96e"
+
+    if ! command -v az >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
+        echo -e "${YELLOW}⚠️ Azure CLI or jq is missing. Skipping Conditional Access check.${NC}"
+        log_warning "Skipped Conditional Access check because Azure CLI or jq is missing."
+        return 0
     fi
 
-    # Trim whitespace
-    MANAGEMENT_GROUP_ID="$(echo "$MANAGEMENT_GROUP_ID" | xargs)"
-
-    # Validate empty
-    if [ -z "$MANAGEMENT_GROUP_ID" ]; then
-        echo -e "${RED}❌ ERROR: Management Group ID cannot be empty.${NC}"
-        log_error "❌ Empty MANAGEMENT_GROUP_ID"
-        HAS_ERRORS=true
-        ERRORS+=("Management Group ID not provided")
-
+    if ! az account show >/dev/null 2>&1; then
+        echo -e "${YELLOW}⚠️ Not logged in to Azure. Skipping Conditional Access check.${NC}"
+        log_warning "Skipped Conditional Access check because Azure CLI is not logged in."
+        return 0
     fi
 
-    # Validate format
-    if [[ ! "$MANAGEMENT_GROUP_ID" =~ ^[a-zA-Z0-9._()-]+$ ]]; then
-        echo -e "${RED}❌ ERROR: Invalid Management Group ID format.${NC}"
-        log_error "❌ Invalid MANAGEMENT_GROUP_ID format"
-        HAS_ERRORS=true
-        ERRORS+=("Invalid Management Group ID format")
+    echo "1. Retrieving Microsoft Graph token via Azure CLI"
 
+    TOKEN=$(az account get-access-token \
+        --resource "$GRAPH_RESOURCE" \
+        --query accessToken \
+        -o tsv 2>/dev/null)
+
+    if [ -z "$TOKEN" ]; then
+        echo -e "${YELLOW}⚠️ Failed to retrieve Microsoft Graph token.${NC}"
+        log_warning "Unable to retrieve Microsoft Graph token. Conditional Access policies could not be evaluated."
+        return 0
     fi
 
-    # Validate existence in Azure
-    if ! az account management-group show --name "$MANAGEMENT_GROUP_ID" -o none 2>/dev/null; then
-        echo -e "${RED}❌ ERROR: Management Group '$MANAGEMENT_GROUP_ID' does not exist or you lack permissions.${NC}"
-        log_error "❌ Invalid or inaccessible MG: $MANAGEMENT_GROUP_ID"
-        HAS_ERRORS=true
-        ERRORS+=("Management Group not found or inaccessible")
+    USER_INFO=$(az account show --query "{tenantId:tenantId, user:user.name}" -o json 2>/dev/null)
+    CURRENT_USER=$(echo "$USER_INFO" | jq -r '.user')
+    CURRENT_TENANT=$(echo "$USER_INFO" | jq -r '.tenantId')
 
+    echo
+    echo "2. Fetching Conditional Access policies from Microsoft Graph"
+
+    ERROR_OUTPUT_FILE="$(mktemp)"
+
+    RAW_POLICIES_JSON=$(az rest \
+        --method GET \
+        --url "${GRAPH_URL}/identity/conditionalAccess/policies" \
+        --headers "Authorization=Bearer ${TOKEN}" \
+        --query 'value' \
+        -o json 2>"$ERROR_OUTPUT_FILE")
+
+    REST_STATUS=$?
+    ERROR_OUTPUT="$(cat "$ERROR_OUTPUT_FILE" 2>/dev/null)"
+    rm -f "$ERROR_OUTPUT_FILE"
+
+    if [ "$REST_STATUS" -ne 0 ] || [ -z "$RAW_POLICIES_JSON" ]; then
+        echo -e "${YELLOW}⚠️ Unable to read Conditional Access policies.${NC}"
+        echo
+        echo -e "${YELLOW}Current User Context:${NC}"
+        echo "  User: $CURRENT_USER"
+        echo "  Tenant ID: $CURRENT_TENANT"
+
+        if [ -n "$ERROR_OUTPUT" ]; then
+            echo
+            echo "Graph error snippet:"
+            echo "$ERROR_OUTPUT" | head -c 500
+            echo
+        fi
+
+        log_warning "Unable to read Conditional Access policies. User may need Global Reader, Security Reader, Security Administrator, Conditional Access Administrator, or a refreshed PIM/Azure CLI token."
+        return 0
     fi
 
-    azure_management_group_policy_check
-
-    if [ $? -ne 0 ]; then
-        HAS_ERRORS=true
-        ERRORS+=("❌ Cortex Management Group Policy validation failed")
+    if [ "$RAW_POLICIES_JSON" = "[]" ]; then
+        echo -e "${GREEN}✅ Successfully read Conditional Access policies. Found 0 policies.${NC}"
+        log_pass "Conditional Access policies were readable. Found 0 policies."
+        return 0
     fi
 
+    ONBOARDING_POLICIES=$(echo "$RAW_POLICIES_JSON" | jq --arg ARM_ID "$ARM_ID" --arg CLOUD_SHELL_ID "$CLOUD_SHELL_ID" '
+        map(select(.state == "enabled")) |
+        map({
+            displayName: .displayName,
+            state: .state,
+            builtInControls: ((.grantControls.builtInControls // []) | join(", ")),
+            clientAppTypes: ((.conditions.clientAppTypes // []) | join(", ")),
+            relevantAppIds: (
+                (.conditions.applications.includeApplications // []) |
+                map(if type == "object" then .id else . end) |
+                map(select(. == $ARM_ID or . == $CLOUD_SHELL_ID))
+            )
+        }) |
+        map(select((.relevantAppIds | length) > 0))
+    ')
+
+    COUNT=$(echo "$ONBOARDING_POLICIES" | jq '. | length')
+
+    if [ "$COUNT" -gt 0 ]; then
+        echo -e "${YELLOW}⚠️ Conditional Access policies may impact onboarding:${NC}"
+        echo
+
+        echo "$ONBOARDING_POLICIES" | jq -r '
+            .[] |
+            "  Name: \(.displayName)\n" +
+            "  State: \(.state)\n" +
+            "  Controls: \(.builtInControls)\n" +
+            "  Client Apps: \(.clientAppTypes)\n" +
+            "  Targeted App IDs: \(.relevantAppIds | join(", "))\n"
+        '
+
+        log_warning "$COUNT enabled Conditional Access policy/policies target Azure Resource Manager or Cloud Shell and may impact onboarding."
+    else
+        echo -e "${GREEN}✅ No enabled Conditional Access policies found targeting ARM or Cloud Shell.${NC}"
+        log_pass "Conditional Access policies were readable and no direct ARM/Cloud Shell impact was detected."
+    fi
+
+    return 0
+}
+
+azure_resource_provider_check() {
     echo
     print_header "Starting Azure Resource Provider Registration Check"
     echo
 
-    echo -e "${YELLOW}NOTE:${NC} If you are utilizing the Terraform deployment method,
-    the Cortex templates will also attempt to automatically register
-    ${YELLOW}Microsoft.EventGrid${NC} and ${YELLOW}Microsoft.KeyVault${NC} as part of the core infrastructure provisioning."
+    echo -e "${YELLOW}NOTE:${NC} This script does not register providers. It only reports provider registration state."
     echo
-    # DOC: Reference - https://learn.microsoft.com/en-us/azure/azure-resource-manager/management/resource-providers-and-types
 
-    # Required Azure Resource Providers
     local PROVIDERS_TO_CHECK=(
         "Microsoft.Security"
         "Microsoft.Insights"
@@ -793,33 +958,20 @@ azure_subscription_check() {
         "Microsoft.Aadiam"
     )
 
-    # get the current subscription ID dynamically
+    local CURRENT_SUBSCRIPTION
     CURRENT_SUBSCRIPTION=$(az account show --query "id" --output tsv 2>/dev/null)
 
     if [ -z "$CURRENT_SUBSCRIPTION" ]; then
-        echo "❌ ERROR: Unable to retrieve the current Azure subscription. Please run 'az login' and try again."
-        log_error "❌ Unable to retrieve Azure subscription. Run 'az login' and try again."
-        exit 1
+        echo -e "${YELLOW}⚠️ Unable to retrieve current Azure subscription.${NC}"
+        log_warning "Unable to retrieve Azure subscription for provider registration check."
+        return 0
     fi
 
     echo "Using subscription: $CURRENT_SUBSCRIPTION"
     echo
 
-    az account set --subscription "$CURRENT_SUBSCRIPTION" 2>/dev/null
+    local FAILED_PROVIDERS=()
 
-    if [ $? -ne 0 ]; then
-        echo "❌ ERROR: Failed to set Azure subscription context."
-        log_error "❌ Failed to set Azure subscription context: $CURRENT_SUBSCRIPTION"
-        exit 1
-    fi
-
-    # this flag will be set to 'false' if any provider fails the check
-    ALL_CHECKS_PASSED=true
-
-    # Initialize an array to track failures
-    FAILED_PROVIDERS=()
-
-    # main Check Loop
     for provider in "${PROVIDERS_TO_CHECK[@]}"; do
         echo -n "Checking provider: $provider ... "
 
@@ -828,205 +980,70 @@ azure_subscription_check() {
             --query "registrationState" \
             --output tsv 2>/dev/null)
 
-        if [ "$STATE" == "Registered" ]; then
-            echo -e "${GREEN}✅ Registered${NC}"
-
-        elif [ "$STATE" == "Registering" ]; then
-            echo -e "${YELLOW}⚠️  Registering${NC}"
-            echo -e "   ${YELLOW}-> This provider is still registering. Please wait 5–15 minutes and re-run this check.${NC}"
-            ALL_CHECKS_PASSED=false
-            FAILED_PROVIDERS+=("$provider (Status: Registering)")
-
-        elif [ "$STATE" == "NotRegistered" ] || [ "$STATE" == "Unregistered" ]; then
-            echo -e "${RED}❌ Not Registered${NC}"
-            echo -e "   ${YELLOW}-> SOLUTION:${NC} This provider is required. Run:"
-            echo -e "      ${BOLD}az provider register --namespace $provider --subscription $CURRENT_SUBSCRIPTION${NC}"
-            ALL_CHECKS_PASSED=false
-            FAILED_PROVIDERS+=("$provider (Status: Not Registered)")
-
-        else
-            echo -e "${RED}❓ Unknown State:${NC} $STATE"
-            echo "   -> An unexpected status was returned. Please check in the Azure Portal."
-            ALL_CHECKS_PASSED=false
-            FAILED_PROVIDERS+=("$provider (Status: Unknown - $STATE)")
-        fi
+        case "$STATE" in
+            Registered)
+                echo -e "${GREEN}✅ Registered${NC}"
+                ;;
+            Registering)
+                echo -e "${YELLOW}⚠️ Registering${NC}"
+                FAILED_PROVIDERS+=("$provider (Status: Registering)")
+                ;;
+            NotRegistered|Unregistered)
+                echo -e "${YELLOW}⚠️ Not Registered${NC}"
+                echo -e "   Suggested action: ${BOLD}az provider register --namespace $provider --subscription $CURRENT_SUBSCRIPTION${NC}"
+                FAILED_PROVIDERS+=("$provider (Status: Not Registered)")
+                ;;
+            *)
+                echo -e "${YELLOW}⚠️ Unknown State: ${STATE:-No response}${NC}"
+                FAILED_PROVIDERS+=("$provider (Status: Unknown - ${STATE:-No response})")
+                ;;
+        esac
     done
 
-    # Final report
     echo
-    if [ "$ALL_CHECKS_PASSED" == "true" ]; then
-        echo -e "${GREEN}🎉 SUCCESS:${NC} All required providers are registered."
 
+    if [ "${#FAILED_PROVIDERS[@]}" -eq 0 ]; then
+        echo -e "${GREEN}✅ All checked providers are registered.${NC}"
+        log_pass "All checked Azure resource providers are registered."
     else
-        echo -e "${RED}🔴 FAILED: The following providers need attention:${NC}"
-
+        echo -e "${YELLOW}⚠️ Provider registration warnings:${NC}"
         for p in "${FAILED_PROVIDERS[@]}"; do
-            echo -e "   - ${YELLOW}$p${NC}"
+            echo -e "   - $p"
         done
 
-        echo
-        echo -e "${YELLOW}After fixing, re-run this script to confirm.${NC}"
-
-        log_error "❌ Provider check failed for: ${FAILED_PROVIDERS[*]}"
+        log_warning "Some Azure resource providers need attention: ${FAILED_PROVIDERS[*]}"
     fi
 
-    # end of resource providers check
+    return 0
+}
 
+azure_subscription_check() {
     echo
-    print_header "Starting Azure Conditional Access Policy Check"
+    print_header "Starting Azure Subscription Preflight"
     echo
-    local GRAPH_URL="https://graph.microsoft.com/v1.0"
-    local GRAPH_RESOURCE="https://graph.microsoft.com"
-    local ARM_ID="797f4846-ba00-4fd7-ba43-dac1f87f440d" #global ID
-    local CLOUD_SHELL_ID="2233b157-f44d-4812-b777-036cdaf9a96e" #global ID
 
-    # prerequisite check
-    if ! command -v az &> /dev/null || ! command -v jq &> /dev/null; then
-        echo -e "${RED}ERROR: Azure CLI ('az') or 'jq' is missing. Please install both.${NC}"
-        exit 1
-    fi
-    if ! az account show &> /dev/null; then
-        echo -e "${RED}ERROR: You are not logged in to Azure. Please run 'az login' first.${NC}"
-        exit 1
-    fi
+    validate_azure_login || print_final_summary
 
-    echo "1. Retrieving Access Token via Azure CLI"
-
-    # retrieve token using the Azure CLI for the Graph Resource
-    TOKEN=$(az account get-access-token --resource "$GRAPH_RESOURCE" --query accessToken -o tsv 2>/dev/null)
-
-    if [ -z "$TOKEN" ]; then
-        echo -e "${RED}ERROR: Failed to retrieve token. Check 'az login' status and permissions.${NC}"
-        exit 1
-    fi
-
-    # retrieve user email and tenant ID
-    USER_INFO=$(az account show --query "{tenantId:tenantId, user:user.name}" -o json 2>/dev/null)
-    CURRENT_USER=$(echo "$USER_INFO" | jq -r '.user')
-    CURRENT_TENANT=$(echo "$USER_INFO" | jq -r '.tenantId')
-
-    # fetch and filter
-    echo -e "\n2. Fetching Policies from Microsoft Graph"
-    # Capture stderr (errors) to a separate variable for better diagnosis
-    ERROR_OUTPUT=$(az rest --method GET --url "${GRAPH_URL}/identity/conditionalAccess/policies" \
-    --headers "Authorization=Bearer ${TOKEN}" \
-    --query 'value' \
-    -o json 2>&1 > /dev/null) # capture stdout into RAW_POLICIES_JSON (implicitly, if successful)
-
-    # Re-run to capture stdout (success) or rely on the fact that az rest fails if raw_policies is empty or an error
-    RAW_POLICIES_JSON=$(az rest --method GET --url "${GRAPH_URL}/identity/conditionalAccess/policies" \
-    --headers "Authorization=Bearer ${TOKEN}" \
-    --query 'value' \
-    -o json 2>/dev/null) # only capture stdout, suppress errors
-
-    # flag to check if we should proceed with policy analysis
-    PROCEED_WITH_ANALYSIS=true
-
-    if [[ "$RAW_POLICIES_JSON" == "[]" || -z "$RAW_POLICIES_JSON" ]]; then
-        echo -e "\n${BLUE}--- 3. Policy Report ---${NC}"
-        # check if the error suggests a permissions issue (e.g., common error codes or lack of output)
-        if [[ -z "$RAW_POLICIES_JSON" ]]; then
-            # this branch handles an empty result, which strongly suggests a permission failure
-            echo -e "${RED}❌ FAILED TO READ: Found 0 Conditional Access Policies in the directory.${NC}"
-            echo -e "\n${YELLOW}Current User Context:"
-            echo -e "  User: ${CURRENT_USER}"
-            echo -e "  Tenant ID: ${CURRENT_TENANT}${NC}"
-            say -e "\n${RED}ACTION REQUIRED: ${YELLOW}Please confirm the user (${CURRENT_USER}) has the necessary roles to read these policies (e.g., Global Reader or Security Reader) in the tenant listed above.${NC}"
-            echo -e "If permissions are incorrect, the result 'Found 0 Policies' may be inaccurate.${NC}"
-            log_error "❌ Unable to read Conditional Access Policies. Likely missing permissions: Global Reader or Security Reader"
-            # #print a specific error if one was captured
-            # if [ -n "$ERROR_OUTPUT" ]; then
-            #     echo -e "${RED}API Error Snippet: ${ERROR_OUTPUT:0:300}...${NC}"
-            # fi
-
-        else
-            # this branch handles a literal '[]' (meaning no policies, but the API call was successful)
-            echo -e "${GREEN}✅ SUCCESS: Found 0 Conditional Access Policies in the directory.${NC}"
-        fi
-
-        # in both cases (empty string or '[]'), we skip the rest of the analysis/filtering
-        PROCEED_WITH_ANALYSIS=false
-    fi
-
-    if $PROCEED_WITH_ANALYSIS; then
-        # filtering and formatting output using jq
-        ONBOARDING_POLICIES=$(echo "$RAW_POLICIES_JSON" | jq --arg ARM_ID "$ARM_ID" --arg CLOUD_SHELL_ID "$CLOUD_SHELL_ID" '
-        map(select(.state == "enabled")) |
-        map({
-            displayName: .displayName,
-            state: .state,
-            builtInControls: (.grantControls.builtInControls | join(", ") // "None"),
-            clientAppTypes: (.conditions.clientAppTypes | join(", ") // "all"),
-            # normalize includeApplications to IDs only
-            includeAppIds: (
-            (.conditions.applications.includeApplications // []) |
-            map(if type == "object" then .id else . end)
-            ),
-            # extract relevant Application IDs
-            relevantAppIds: (
-            (.conditions.applications.includeApplications // []) |
-            map(if type == "object" then .id else . end) |
-            map(select(. == $ARM_ID or . == $CLOUD_SHELL_ID))
-            ),
-            # impact warning
-            impactWarning: (
-            if any(
-                (.conditions.applications.includeApplications // [])[];
-                (if type == "object" then .id else . end) == $ARM_ID or
-                (if type == "object" then .id else . end) == $CLOUD_SHELL_ID
-            )
-            then "🚨 IMPACT: Includes critical Azure service (ARM/Cloud Shell). Potential for CLI access issues. 🚨"
-            else "No direct ARM/Cloud Shell impact detected."
-            end
-            )
-        })
-        ')
-
-        COUNT=$(echo "$ONBOARDING_POLICIES" | jq '. | length')
-
-        # report results
-        if [[ $COUNT -gt 0 ]]; then
-            # Case 1: Policies were found
-            echo -e "Take into consideration that these policies could impact on onboarding:\n"
-
-            # use jq to format the final table-like output
-            echo "$ONBOARDING_POLICIES" | jq -r '
-            .[] | 
-            "  Name: \(.displayName)\n" +
-            "  State: \(.state)\n" +
-            "  Controls: \(.builtInControls)\n" +
-            "  Client Apps: \(.clientAppTypes)\n" +
-            "  Targeted App IDs: \(.relevantAppIds | join(", ") // "None")\n" +
-            "  \(.impactWarning)\n" +
-            " "
-            '
-
-            echo -e "\n${YELLOW}NOTE ON IMPACT:
-            - 'block' in Controls means CLI access will fail instantly.
-            - 'require...' in Controls means CLI access will require MFA, Compliant Device, etc."
-
-        else
-            # case 2: No policies were found (after filtering, not due to an empty initial fetch)
-            echo -e "${GREEN}No Conditional Access policies were found to be currently impacting onboarding (after filtering).${NC}\n"
-            
-            # this is a general safety note
-            say "${YELLOW}Note: It is still recommended to confirm the user has the necessary permissions (e.g., Global Reader or Security Reader role) to view all Conditional Access policies in the Microsoft Entra ID tenant.${NC}"
-        fi
-    fi
-    # end of Azure CAP validation
+    # Advisory checks only. These should not fail the script.
+    azure_resource_provider_check
+    azure_conditional_access_policy_check
 
     echo
     print_header "Starting Azure Subscription Preflight Permissions Check"
     echo
-    echo "Note: Some delete permissions are included for rollback. They're not required for Onboarding."
+    echo "Note: Some delete permissions are included for rollback. They're not required for onboarding."
     echo
+
     # deps
-    command -v az >/dev/null || { echo "az CLI not found" >&2; return 2; }
-    command -v jq >/dev/null || { echo "jq not found (Cloud Shell usually has it)" >&2; return 2; }
+    command -v az >/dev/null || { log_error "az CLI not found"; print_final_summary; }
+    command -v jq >/dev/null || { log_error "jq not found"; print_final_summary; }
 
     # scope
     local SUBSCRIPTION_ID SCOPE ASSIGNEE
-    SUBSCRIPTION_ID="$(az account show --query id -o tsv 2>/dev/null)" || { echo "Cannot get subscription id" >&2; return 2; }
+    SUBSCRIPTION_ID="$(az account show --query id -o tsv 2>/dev/null)" || {
+        log_error "Cannot get Azure subscription ID."
+        print_final_summary
+    }
     [[ -n "$SUBSCRIPTION_ID" ]] || { echo "Empty subscription id" >&2; return 2; }
     SCOPE="/subscriptions/${SUBSCRIPTION_ID}"
 
@@ -1126,332 +1143,46 @@ azure_subscription_check() {
     echo
     if (( ${#missing[@]} == 0 )); then
         echo -e "${GREEN}Actions OK${NC} all required actions are satisfied."
-        printf '  -%s\n' "${azure_single_actions[@]}"
+        printf '  - %s\n' "${azure_single_actions[@]}"
         echo
         echo "You can onboard this Azure subscription ($SUBSCRIPTION_ID) in Cortex Cloud"
-        return 0
+        log_pass "Required Azure subscription permissions are present for subscription $SUBSCRIPTION_ID."
     else
-        echo -e "${GREEN}You have the following required actions:"
+        echo -e "${GREEN}You have the following required actions:${NC}"
         read_lines_into_array DIF < <(printf '%s\n' "${azure_single_actions[@]}" \
-        | grep -Fxv -f <(printf '%s\n' "${missing[@]}"))
+            | grep -Fxv -f <(printf '%s\n' "${missing[@]}"))
         printf '%s\n' "${DIF[@]}"
         echo
-        echo -e "${RED}Missing permissions:"
+        echo -e "${RED}Missing permissions:${NC}"
         printf '  - %s\n' "${missing[@]}"
-        log_error "❌ Missing permissions."
-        # return 1
+        log_error "Missing required Azure subscription permissions: ${missing[*]}"
     fi
 
-    #final summary
-    if [ "$HAS_ERRORS" = true ]; then
-    echo -e "\n${RED}🔴 VALIDATION FAILED — Found ${#ERRORS[@]} issue(s):${NC}"
-
-    for err in "${ERRORS[@]}"; do
-        echo -e "\n$err"
-    done
-
-    echo -e "\n${YELLOW}Please fix the issues above and re-run the script.${NC}\n"
-    exit 1
-    else
-        echo -e "\n${GREEN}✅ All checks passed successfully!${NC}\n"
-    fi
+    print_final_summary
 }
+
 azure_management_group_check() {
     echo
-    print_header "Azure Management Group Input"
+    print_header "Starting Azure Management Group Preflight"
     echo
 
-    # Prompt only if not already set
-    if [ -z "$MANAGEMENT_GROUP_ID" ]; then
-        read -rp "Enter Management Group ID: " MANAGEMENT_GROUP_ID
-    fi
+    validate_azure_login || print_final_summary
+    validate_management_group_input || print_final_summary
 
-    # Trim whitespace
-    MANAGEMENT_GROUP_ID="$(echo "$MANAGEMENT_GROUP_ID" | xargs)"
-
-    # Validate empty
-    if [ -z "$MANAGEMENT_GROUP_ID" ]; then
-        echo -e "${RED}❌ ERROR: Management Group ID cannot be empty.${NC}"
-        log_error "❌ Empty MANAGEMENT_GROUP_ID"
-        HAS_ERRORS=true
-        ERRORS+=("Management Group ID not provided")
-
-    fi
-
-    # Validate format
-    if [[ ! "$MANAGEMENT_GROUP_ID" =~ ^[a-zA-Z0-9._()-]+$ ]]; then
-        echo -e "${RED}❌ ERROR: Invalid Management Group ID format.${NC}"
-        log_error "❌ Invalid MANAGEMENT_GROUP_ID format"
-        HAS_ERRORS=true
-        ERRORS+=("Invalid Management Group ID format")
-
-    fi
-
-    # Validate existence in Azure
-    if ! az account management-group show --name "$MANAGEMENT_GROUP_ID" -o none 2>/dev/null; then
-        echo -e "${RED}❌ ERROR: Management Group '$MANAGEMENT_GROUP_ID' does not exist or you lack permissions.${NC}"
-        log_error "❌ Invalid or inaccessible MG: $MANAGEMENT_GROUP_ID"
-        HAS_ERRORS=true
-        ERRORS+=("Management Group not found or inaccessible")
-
-    fi
-
+    # Advisory checks only. These should not fail the script.
     azure_management_group_policy_check
-
-    if [ $? -ne 0 ]; then
-        HAS_ERRORS=true
-        ERRORS+=("❌ Cortex Management Group Policy validation failed")
-    fi
-
-    echo
-    print_header "Starting Azure Resource Provider Registration Check"
-    echo
-
-    echo -e "${YELLOW}NOTE:${NC} If you are utilizing the Terraform deployment method,
-    the Cortex templates will also attempt to automatically register
-    ${YELLOW}Microsoft.EventGrid${NC} and ${YELLOW}Microsoft.KeyVault${NC} as part of the core infrastructure provisioning."
-    echo
-    # DOC: Reference - https://learn.microsoft.com/en-us/azure/azure-resource-manager/management/resource-providers-and-types
-
-    # Required Azure Resource Providers
-    local PROVIDERS_TO_CHECK=(
-        "Microsoft.Security"
-        "Microsoft.Insights"
-        "Microsoft.Communication"
-        "Microsoft.Datadog"
-        "Microsoft.Aadiam"
-    )
-
-    # get the current subscription ID dynamically
-    CURRENT_SUBSCRIPTION=$(az account show --query "id" --output tsv 2>/dev/null)
-
-    if [ -z "$CURRENT_SUBSCRIPTION" ]; then
-        echo "❌ ERROR: Unable to retrieve the current Azure subscription. Please run 'az login' and try again."
-        log_error "❌ Unable to retrieve Azure subscription. Run 'az login' and try again."
-        exit 1
-    fi
-
-    echo "Using subscription: $CURRENT_SUBSCRIPTION"
-    echo
-
-    az account set --subscription "$CURRENT_SUBSCRIPTION" 2>/dev/null
-
-    if [ $? -ne 0 ]; then
-        echo "❌ ERROR: Failed to set Azure subscription context."
-        log_error "❌ Failed to set Azure subscription context: $CURRENT_SUBSCRIPTION"
-        exit 1
-    fi
-
-    # this flag will be set to 'false' if any provider fails the check
-    ALL_CHECKS_PASSED=true
-
-    # Initialize an array to track failures
-    FAILED_PROVIDERS=()
-
-    # main Check Loop
-    for provider in "${PROVIDERS_TO_CHECK[@]}"; do
-        echo -n "Checking provider: $provider ... "
-
-        STATE=$(az provider show \
-            --namespace "$provider" \
-            --query "registrationState" \
-            --output tsv 2>/dev/null)
-
-        if [ "$STATE" == "Registered" ]; then
-            echo -e "${GREEN}✅ Registered${NC}"
-
-        elif [ "$STATE" == "Registering" ]; then
-            echo -e "${YELLOW}⚠️  Registering${NC}"
-            echo -e "   ${YELLOW}-> This provider is still registering. Please wait 5–15 minutes and re-run this check.${NC}"
-            ALL_CHECKS_PASSED=false
-            FAILED_PROVIDERS+=("$provider (Status: Registering)")
-
-        elif [ "$STATE" == "NotRegistered" ] || [ "$STATE" == "Unregistered" ]; then
-            echo -e "${RED}❌ Not Registered${NC}"
-            echo -e "   ${YELLOW}-> SOLUTION:${NC} This provider is required. Run:"
-            echo -e "      ${BOLD}az provider register --namespace $provider --subscription $CURRENT_SUBSCRIPTION${NC}"
-            ALL_CHECKS_PASSED=false
-            FAILED_PROVIDERS+=("$provider (Status: Not Registered)")
-
-        else
-            echo -e "${RED}❓ Unknown State:${NC} $STATE"
-            echo "   -> An unexpected status was returned. Please check in the Azure Portal."
-            ALL_CHECKS_PASSED=false
-            FAILED_PROVIDERS+=("$provider (Status: Unknown - $STATE)")
-        fi
-    done
-
-    # Final report
-    echo
-    if [ "$ALL_CHECKS_PASSED" == "true" ]; then
-        echo -e "${GREEN}🎉 SUCCESS:${NC} All required providers are registered."
-
-    else
-        echo -e "${RED}🔴 FAILED: The following providers need attention:${NC}"
-
-        for p in "${FAILED_PROVIDERS[@]}"; do
-            echo -e "   - ${YELLOW}$p${NC}"
-        done
-
-        echo
-        echo -e "${YELLOW}After fixing, re-run this script to confirm.${NC}"
-
-        log_error "❌ Provider check failed for: ${FAILED_PROVIDERS[*]}"
-    fi
-
-    # end of resource providers check
-
-    echo
-    print_header "Starting Azure Conditional Access Policy Check"
-    echo
-    local GRAPH_URL="https://graph.microsoft.com/v1.0"
-    local GRAPH_RESOURCE="https://graph.microsoft.com"
-    local ARM_ID="797f4846-ba00-4fd7-ba43-dac1f87f440d" #global ID
-    local CLOUD_SHELL_ID="2233b157-f44d-4812-b777-036cdaf9a96e" #global ID
-
-    # prerequisite check
-    if ! command -v az &> /dev/null || ! command -v jq &> /dev/null; then
-        echo -e "${RED}ERROR: Azure CLI ('az') or 'jq' is missing. Please install both.${NC}"
-        exit 1
-    fi
-    if ! az account show &> /dev/null; then
-        echo -e "${RED}ERROR: You are not logged in to Azure. Please run 'az login' first.${NC}"
-        exit 1
-    fi
-
-    echo "1. Retrieving Access Token via Azure CLI"
-
-    # retrieve token using the Azure CLI for the Graph Resource
-    TOKEN=$(az account get-access-token --resource "$GRAPH_RESOURCE" --query accessToken -o tsv 2>/dev/null)
-
-    if [ -z "$TOKEN" ]; then
-        echo -e "${RED}ERROR: Failed to retrieve token. Check 'az login' status and permissions.${NC}"
-        exit 1
-    fi
-
-    # retrieve user email and tenant ID
-    USER_INFO=$(az account show --query "{tenantId:tenantId, user:user.name}" -o json 2>/dev/null)
-    CURRENT_USER=$(echo "$USER_INFO" | jq -r '.user')
-    CURRENT_TENANT=$(echo "$USER_INFO" | jq -r '.tenantId')
-
-    # fetch and filter
-    echo -e "\n2. Fetching Policies from Microsoft Graph"
-    # Capture stderr (errors) to a separate variable for better diagnosis
-    ERROR_OUTPUT=$(az rest --method GET --url "${GRAPH_URL}/identity/conditionalAccess/policies" \
-    --headers "Authorization=Bearer ${TOKEN}" \
-    --query 'value' \
-    -o json 2>&1 > /dev/null) # capture stdout into RAW_POLICIES_JSON (implicitly, if successful)
-
-    # Re-run to capture stdout (success) or rely on the fact that az rest fails if raw_policies is empty or an error
-    RAW_POLICIES_JSON=$(az rest --method GET --url "${GRAPH_URL}/identity/conditionalAccess/policies" \
-    --headers "Authorization=Bearer ${TOKEN}" \
-    --query 'value' \
-    -o json 2>/dev/null) # only capture stdout, suppress errors
-
-    # flag to check if we should proceed with policy analysis
-    PROCEED_WITH_ANALYSIS=true
-
-    if [[ "$RAW_POLICIES_JSON" == "[]" || -z "$RAW_POLICIES_JSON" ]]; then
-        echo -e "\n${BLUE}--- 3. Policy Report ---${NC}"
-        # check if the error suggests a permissions issue (e.g., common error codes or lack of output)
-        if [[ -z "$RAW_POLICIES_JSON" ]]; then
-            # this branch handles an empty result, which strongly suggests a permission failure
-            echo -e "${RED}❌ FAILED TO READ: Found 0 Conditional Access Policies in the directory.${NC}"
-            echo -e "\n${YELLOW}Current User Context:"
-            echo -e "  User: ${CURRENT_USER}"
-            echo -e "  Tenant ID: ${CURRENT_TENANT}${NC}"
-            say -e "\n${RED}ACTION REQUIRED: ${YELLOW}Please confirm the user (${CURRENT_USER}) has the necessary roles to read these policies (e.g., Global Reader or Security Reader) in the tenant listed above.${NC}"
-            echo -e "If permissions are incorrect, the result 'Found 0 Policies' may be inaccurate.${NC}"
-            log_error "❌ Unable to read Conditional Access Policies. Likely missing permissions: Global Reader or Security Reader"            
-            # #print a specific error if one was captured
-            # if [ -n "$ERROR_OUTPUT" ]; then
-            #     echo -e "${RED}API Error Snippet: ${ERROR_OUTPUT:0:300}...${NC}"
-            # fi
-
-        else
-            # this branch handles a literal '[]' (meaning no policies, but the API call was successful)
-            echo -e "${GREEN}✅ SUCCESS: Found 0 Conditional Access Policies in the directory.${NC}"
-        fi
-
-        # in both cases (empty string or '[]'), we skip the rest of the analysis/filtering
-        PROCEED_WITH_ANALYSIS=false
-    fi
-
-    if $PROCEED_WITH_ANALYSIS; then
-        # filtering and formatting output using jq
-        ONBOARDING_POLICIES=$(echo "$RAW_POLICIES_JSON" | jq --arg ARM_ID "$ARM_ID" --arg CLOUD_SHELL_ID "$CLOUD_SHELL_ID" '
-        map(select(.state == "enabled")) |
-        map({
-            displayName: .displayName,
-            state: .state,
-            builtInControls: (.grantControls.builtInControls | join(", ") // "None"),
-            clientAppTypes: (.conditions.clientAppTypes | join(", ") // "all"),
-            # normalize includeApplications to IDs only
-            includeAppIds: (
-            (.conditions.applications.includeApplications // []) |
-            map(if type == "object" then .id else . end)
-            ),
-            # extract relevant Application IDs
-            relevantAppIds: (
-            (.conditions.applications.includeApplications // []) |
-            map(if type == "object" then .id else . end) |
-            map(select(. == $ARM_ID or . == $CLOUD_SHELL_ID))
-            ),
-            # impact warning
-            impactWarning: (
-            if any(
-                (.conditions.applications.includeApplications // [])[];
-                (if type == "object" then .id else . end) == $ARM_ID or
-                (if type == "object" then .id else . end) == $CLOUD_SHELL_ID
-            )
-            then "🚨 IMPACT: Includes critical Azure service (ARM/Cloud Shell). Potential for CLI access issues. 🚨"
-            else "No direct ARM/Cloud Shell impact detected."
-            end
-            )
-        })
-        ')
-
-        COUNT=$(echo "$ONBOARDING_POLICIES" | jq '. | length')
-
-        # report results
-        if [[ $COUNT -gt 0 ]]; then
-            # Case 1: Policies were found
-            echo -e "Take into consideration that these policies could impact on onboarding:\n"
-
-            # use jq to format the final table-like output
-            echo "$ONBOARDING_POLICIES" | jq -r '
-            .[] | 
-            "  Name: \(.displayName)\n" +
-            "  State: \(.state)\n" +
-            "  Controls: \(.builtInControls)\n" +
-            "  Client Apps: \(.clientAppTypes)\n" +
-            "  Targeted App IDs: \(.relevantAppIds | join(", ") // "None")\n" +
-            "  \(.impactWarning)\n" +
-            " "
-            '
-
-            echo -e "\n${YELLOW}NOTE ON IMPACT:
-            - 'block' in Controls means CLI access will fail instantly.
-            - 'require...' in Controls means CLI access will require MFA, Compliant Device, etc."
-
-        else
-            # case 2: No policies were found (after filtering, not due to an empty initial fetch)
-            echo -e "${GREEN}No Conditional Access policies were found to be currently impacting onboarding (after filtering).${NC}\n"
-            
-            # this is a general safety note
-            say -e "${YELLOW}Note: It is still recommended to confirm the user has the necessary permissions (e.g., Global Reader or Security Reader role) to view all Conditional Access policies in the Microsoft Entra ID tenant.${NC}"
-        fi
-    fi
-    # end of Azure CAP validation
+    azure_resource_provider_check
+    azure_conditional_access_policy_check
 
     echo
     print_header "Starting Azure Management Group Preflight Permissions Check"
     echo
-    echo "Note: Some delete permissions are included for rollback. They're not required for Onboarding."
+    echo "Note: Some delete permissions are included for rollback. They're not required for onboarding."
     echo
+
     # deps
-    command -v az >/dev/null || { echo "az CLI not found" >&2; return 2; }
-    command -v jq >/dev/null || { echo "jq not found (Cloud Shell usually has it)" >&2; return 2; }
+    command -v az >/dev/null || { log_error "az CLI not found"; print_final_summary; }
+    command -v jq >/dev/null || { log_error "jq not found"; print_final_summary; }
 
     # management group scope
     local MG_SCOPE ASSIGNEE
@@ -1644,489 +1375,259 @@ azure_management_group_check() {
         echo
         echo -e "${GREEN}Permissions OK${NC} — all required entries for MG scope are satisfied."
         printf '  - %s\n' "${azure_mg_required[@]}"
+        log_pass "Required Azure Management Group permissions are present at $MG_SCOPE."
     else
         (( audts == 0 )) && echo "" || echo "Make sure you have Global Administrator role assigned in Entra ID instance to onboard this Management Group in Cortex Cloud"
         echo
-        echo -e "${RED}Missing permissions at MG scope:"
+        echo -e "${RED}Missing permissions at MG scope:${NC}"
         printf '  - %s\n' "${missing[@]}"
-        log_error "❌ Missing permissions."
-        # return 1
+        log_error "Missing required Azure Management Group permissions at $MG_SCOPE: ${missing[*]}"
     fi
 
-    #final summary
-    if [ "$HAS_ERRORS" = true ]; then
-    echo -e "\n${RED}🔴 VALIDATION FAILED — Found ${#ERRORS[@]} issue(s):${NC}"
-
-    for err in "${ERRORS[@]}"; do
-        echo -e "\n$err"
-    done
-
-    echo -e "\n${YELLOW}Please fix the issues above and re-run the script.${NC}\n"
-    exit 1
-    else
-        echo -e "\n${GREEN}✅ All checks passed successfully!${NC}\n"
-    fi
+    print_final_summary
 }
+
 azure_tenant_check() {
     echo
-    print_header "Azure Management Group Input"
+    print_header "Starting Azure Tenant Preflight"
     echo
 
-    # Prompt only if not already set
-    if [ -z "$MANAGEMENT_GROUP_ID" ]; then
-        read -rp "Enter Management Group ID: " MANAGEMENT_GROUP_ID
-    fi
+    validate_azure_login || print_final_summary
 
-    # Trim whitespace
-    MANAGEMENT_GROUP_ID="$(echo "$MANAGEMENT_GROUP_ID" | xargs)"
-
-    # Validate empty
-    if [ -z "$MANAGEMENT_GROUP_ID" ]; then
-        echo -e "${RED}❌ ERROR: Management Group ID cannot be empty.${NC}"
-        log_error "❌ Empty MANAGEMENT_GROUP_ID"
-        HAS_ERRORS=true
-        ERRORS+=("Management Group ID not provided")
-
-    fi
-
-    # Validate format
-    if [[ ! "$MANAGEMENT_GROUP_ID" =~ ^[a-zA-Z0-9._()-]+$ ]]; then
-        echo -e "${RED}❌ ERROR: Invalid Management Group ID format.${NC}"
-        log_error "❌ Invalid MANAGEMENT_GROUP_ID format"
-        HAS_ERRORS=true
-        ERRORS+=("Invalid Management Group ID format")
-
-    fi
-
-    # Validate existence in Azure
-    if ! az account management-group show --name "$MANAGEMENT_GROUP_ID" -o none 2>/dev/null; then
-        echo -e "${RED}❌ ERROR: Management Group '$MANAGEMENT_GROUP_ID' does not exist or you lack permissions.${NC}"
-        log_error "❌ Invalid or inaccessible MG: $MANAGEMENT_GROUP_ID"
-        HAS_ERRORS=true
-        ERRORS+=("Management Group not found or inaccessible")
-
-    fi
-
-    azure_management_group_policy_check
-
-    if [ $? -ne 0 ]; then
-        HAS_ERRORS=true
-        ERRORS+=("❌ Cortex Management Group Policy validation failed")
-    fi
-
-    echo
-    print_header "Starting Azure Resource Provider Registration Check"
-    echo
-
-    echo -e "${YELLOW}NOTE:${NC} If you are utilizing the Terraform deployment method,
-    the Cortex templates will also attempt to automatically register
-    ${YELLOW}Microsoft.EventGrid${NC} and ${YELLOW}Microsoft.KeyVault${NC} as part of the core infrastructure provisioning."
-    echo
-    # DOC: Reference - https://learn.microsoft.com/en-us/azure/azure-resource-manager/management/resource-providers-and-types
-
-    # Required Azure Resource Providers
-    local PROVIDERS_TO_CHECK=(
-        "Microsoft.Security"
-        "Microsoft.Insights"
-        "Microsoft.Communication"
-        "Microsoft.Datadog"
-        "Microsoft.Aadiam"
-    )
-
-    # get the current subscription ID dynamically
-    CURRENT_SUBSCRIPTION=$(az account show --query "id" --output tsv 2>/dev/null)
-
-    if [ -z "$CURRENT_SUBSCRIPTION" ]; then
-        echo "❌ ERROR: Unable to retrieve the current Azure subscription. Please run 'az login' and try again."
-        log_error "❌ Unable to retrieve Azure subscription. Run 'az login' and try again."
-        exit 1
-    fi
-
-    echo "Using subscription: $CURRENT_SUBSCRIPTION"
-    echo
-
-    az account set --subscription "$CURRENT_SUBSCRIPTION" 2>/dev/null
-
-    if [ $? -ne 0 ]; then
-        echo "❌ ERROR: Failed to set Azure subscription context."
-        log_error "❌ Failed to set Azure subscription context: $CURRENT_SUBSCRIPTION"
-        exit 1
-    fi
-
-    # this flag will be set to 'false' if any provider fails the check
-    ALL_CHECKS_PASSED=true
-
-    # Initialize an array to track failures
-    FAILED_PROVIDERS=()
-
-    # main Check Loop
-    for provider in "${PROVIDERS_TO_CHECK[@]}"; do
-        echo -n "Checking provider: $provider ... "
-
-        STATE=$(az provider show \
-            --namespace "$provider" \
-            --query "registrationState" \
-            --output tsv 2>/dev/null)
-
-        if [ "$STATE" == "Registered" ]; then
-            echo -e "${GREEN}✅ Registered${NC}"
-
-        elif [ "$STATE" == "Registering" ]; then
-            echo -e "${YELLOW}⚠️  Registering${NC}"
-            echo -e "   ${YELLOW}-> This provider is still registering. Please wait 5–15 minutes and re-run this check.${NC}"
-            ALL_CHECKS_PASSED=false
-            FAILED_PROVIDERS+=("$provider (Status: Registering)")
-
-        elif [ "$STATE" == "NotRegistered" ] || [ "$STATE" == "Unregistered" ]; then
-            echo -e "${RED}❌ Not Registered${NC}"
-            echo -e "   ${YELLOW}-> SOLUTION:${NC} This provider is required. Run:"
-            echo -e "      ${BOLD}az provider register --namespace $provider --subscription $CURRENT_SUBSCRIPTION${NC}"
-            ALL_CHECKS_PASSED=false
-            FAILED_PROVIDERS+=("$provider (Status: Not Registered)")
-
-        else
-            echo -e "${RED}❓ Unknown State:${NC} $STATE"
-            echo "   -> An unexpected status was returned. Please check in the Azure Portal."
-            ALL_CHECKS_PASSED=false
-            FAILED_PROVIDERS+=("$provider (Status: Unknown - $STATE)")
-        fi
-    done
-
-    # Final report
-    echo
-    if [ "$ALL_CHECKS_PASSED" == "true" ]; then
-        echo -e "${GREEN}🎉 SUCCESS:${NC} All required providers are registered."
-
-    else
-        echo -e "${RED}🔴 FAILED: The following providers need attention:${NC}"
-
-        for p in "${FAILED_PROVIDERS[@]}"; do
-            echo -e "   - ${YELLOW}$p${NC}"
-        done
-
-        echo
-        echo -e "${YELLOW}After fixing, re-run this script to confirm.${NC}"
-
-        log_error "❌ Provider check failed for: ${FAILED_PROVIDERS[*]}"
-    fi
-
-    # end of resource providers check
-
-
-    echo
-    print_header "Starting Azure Conditional Access Policy Check"
-    echo
-    local GRAPH_URL="https://graph.microsoft.com/v1.0"
-    local GRAPH_RESOURCE="https://graph.microsoft.com"
-    local ARM_ID="797f4846-ba00-4fd7-ba43-dac1f87f440d" #global ID
-    local CLOUD_SHELL_ID="2233b157-f44d-4812-b777-036cdaf9a96e" #global ID
-
-    # prerequisite check
-    if ! command -v az &> /dev/null || ! command -v jq &> /dev/null; then
-        echo -e "${RED}ERROR: Azure CLI ('az') or 'jq' is missing. Please install both.${NC}"
-        exit 1
-    fi
-    if ! az account show &> /dev/null; then
-        echo -e "${RED}ERROR: You are not logged in to Azure. Please run 'az login' first.${NC}"
-        exit 1
-    fi
-
-    echo "1. Retrieving Access Token via Azure CLI"
-
-    # retrieve token using the Azure CLI for the Graph Resource
-    TOKEN=$(az account get-access-token --resource "$GRAPH_RESOURCE" --query accessToken -o tsv 2>/dev/null)
-
-    if [ -z "$TOKEN" ]; then
-        echo -e "${RED}ERROR: Failed to retrieve token. Check 'az login' status and permissions.${NC}"
-        exit 1
-    fi
-
-    # retrieve user email and tenant ID
-    USER_INFO=$(az account show --query "{tenantId:tenantId, user:user.name}" -o json 2>/dev/null)
-    CURRENT_USER=$(echo "$USER_INFO" | jq -r '.user')
-    CURRENT_TENANT=$(echo "$USER_INFO" | jq -r '.tenantId')
-
-    # fetch and filter
-    echo -e "\n2. Fetching Policies from Microsoft Graph"
-    # Capture stderr (errors) to a separate variable for better diagnosis
-    ERROR_OUTPUT=$(az rest --method GET --url "${GRAPH_URL}/identity/conditionalAccess/policies" \
-    --headers "Authorization=Bearer ${TOKEN}" \
-    --query 'value' \
-    -o json 2>&1 > /dev/null) # capture stdout into RAW_POLICIES_JSON (implicitly, if successful)
-
-    # Re-run to capture stdout (success) or rely on the fact that az rest fails if raw_policies is empty or an error
-    RAW_POLICIES_JSON=$(az rest --method GET --url "${GRAPH_URL}/identity/conditionalAccess/policies" \
-    --headers "Authorization=Bearer ${TOKEN}" \
-    --query 'value' \
-    -o json 2>/dev/null) # only capture stdout, suppress errors
-
-    # flag to check if we should proceed with policy analysis
-    PROCEED_WITH_ANALYSIS=true
-
-    if [[ "$RAW_POLICIES_JSON" == "[]" || -z "$RAW_POLICIES_JSON" ]]; then
-        echo -e "\n${BLUE}--- 3. Policy Report ---${NC}"
-        # check if the error suggests a permissions issue (e.g., common error codes or lack of output)
-        if [[ -z "$RAW_POLICIES_JSON" ]]; then
-            # this branch handles an empty result, which strongly suggests a permission failure
-            echo -e "${RED}❌ FAILED TO READ: Found 0 Conditional Access Policies in the directory.${NC}"
-            echo -e "\n${YELLOW}Current User Context:"
-            echo -e "  User: ${CURRENT_USER}"
-            echo -e "  Tenant ID: ${CURRENT_TENANT}${NC}"
-            say -e "\n${RED}ACTION REQUIRED: ${YELLOW}Please confirm the user (${CURRENT_USER}) has the necessary roles to read these policies (e.g., Global Reader or Security Reader) in the tenant listed above.${NC}"
-            echo -e "If permissions are incorrect, the result 'Found 0 Policies' may be inaccurate.${NC}"
-            log_error "❌ Unable to read Conditional Access Policies. Likely missing permissions: Global Reader or Security Reader"
-            # #print a specific error if one was captured
-            # if [ -n "$ERROR_OUTPUT" ]; then
-            #     echo -e "${RED}API Error Snippet: ${ERROR_OUTPUT:0:300}...${NC}"
-            # fi
-
-        else
-            # this branch handles a literal '[]' (meaning no policies, but the API call was successful)
-            echo -e "${GREEN}✅ SUCCESS: Found 0 Conditional Access Policies in the directory.${NC}"
-        fi
-
-        # in both cases (empty string or '[]'), we skip the rest of the analysis/filtering
-        PROCEED_WITH_ANALYSIS=false
-    fi
-
-    if $PROCEED_WITH_ANALYSIS; then
-        # filtering and formatting output using jq
-        ONBOARDING_POLICIES=$(echo "$RAW_POLICIES_JSON" | jq --arg ARM_ID "$ARM_ID" --arg CLOUD_SHELL_ID "$CLOUD_SHELL_ID" '
-        map(select(.state == "enabled")) |
-        map({
-            displayName: .displayName,
-            state: .state,
-            builtInControls: (.grantControls.builtInControls | join(", ") // "None"),
-            clientAppTypes: (.conditions.clientAppTypes | join(", ") // "all"),
-            # normalize includeApplications to IDs only
-            includeAppIds: (
-            (.conditions.applications.includeApplications // []) |
-            map(if type == "object" then .id else . end)
-            ),
-            # extract relevant Application IDs
-            relevantAppIds: (
-            (.conditions.applications.includeApplications // []) |
-            map(if type == "object" then .id else . end) |
-            map(select(. == $ARM_ID or . == $CLOUD_SHELL_ID))
-            ),
-            # impact warning
-            impactWarning: (
-            if any(
-                (.conditions.applications.includeApplications // [])[];
-                (if type == "object" then .id else . end) == $ARM_ID or
-                (if type == "object" then .id else . end) == $CLOUD_SHELL_ID
-            )
-            then "🚨 IMPACT: Includes critical Azure service (ARM/Cloud Shell). Potential for CLI access issues. 🚨"
-            else "No direct ARM/Cloud Shell impact detected."
-            end
-            )
-        })
-        ')
-
-        COUNT=$(echo "$ONBOARDING_POLICIES" | jq '. | length')
-
-        # report results
-        if [[ $COUNT -gt 0 ]]; then
-            # Case 1: Policies were found
-            echo -e "Take into consideration that these policies could impact on onboarding:\n"
-
-            # use jq to format the final table-like output
-            echo "$ONBOARDING_POLICIES" | jq -r '
-            .[] | 
-            "  Name: \(.displayName)\n" +
-            "  State: \(.state)\n" +
-            "  Controls: \(.builtInControls)\n" +
-            "  Client Apps: \(.clientAppTypes)\n" +
-            "  Targeted App IDs: \(.relevantAppIds | join(", ") // "None")\n" +
-            "  \(.impactWarning)\n" +
-            " "
-            '
-
-            echo -e "\n${YELLOW}NOTE ON IMPACT:
-            - 'block' in Controls means CLI access will fail instantly.
-            - 'require...' in Controls means CLI access will require MFA, Compliant Device, etc."
-
-        else
-            # case 2: No policies were found (after filtering, not due to an empty initial fetch)
-            echo -e "${GREEN}No Conditional Access policies were found to be currently impacting onboarding (after filtering).${NC}\n"
-            
-            # this is a general safety note
-            say -e "${YELLOW}Note: It is still recommended to confirm the user has the necessary permissions (e.g., Global Reader or Security Reader role) to view all Conditional Access policies in the Microsoft Entra ID tenant.${NC}"
-        fi
-    fi
-    # end of Azure CAP validation
+    # Advisory checks only. These should not fail the script.
+    azure_resource_provider_check
+    azure_conditional_access_policy_check
 
     echo
     print_header "Checking Entra ID role: Global Administrator"
     echo
-    # deps
-    command -v az >/dev/null || { echo -e "${RED}az CLI not found${NC}" >&2; return 2; }
-    command -v jq >/dev/null || { echo -e "${RED}jq not found${NC}" >&2; return 2; }
 
-    # scope / identity
+    command -v az >/dev/null || {
+        echo -e "${RED}az CLI not found${NC}" >&2
+        log_error "az CLI not found."
+        print_final_summary
+    }
+
+    command -v jq >/dev/null || {
+        echo -e "${RED}jq not found${NC}" >&2
+        log_error "jq not found."
+        print_final_summary
+    }
+
     local TENANT_ID UPN OBJECT_ID
     TENANT_ID="${AZURE_TENANT_ID:-$(az account show --query tenantId -o tsv 2>/dev/null)}"
-    [[ -n "$TENANT_ID" ]] || { echo -e "${RED}Cannot resolve tenant ID${NC}" >&2; return 2; }
+
+    if [[ -z "$TENANT_ID" ]]; then
+        echo -e "${RED}Cannot resolve tenant ID.${NC}" >&2
+        log_error "Cannot resolve Azure tenant ID."
+        print_final_summary
+    fi
 
     UPN="$(az account show --query user.name -o tsv 2>/dev/null || true)"
     OBJECT_ID="$(az ad signed-in-user show --query id -o tsv 2>/dev/null || true)"
 
     echo "Tenant:          $TENANT_ID"
-    [[ -n "$UPN"       ]] && echo "Signed-in UPN:    $UPN"
+    [[ -n "$UPN" ]] && echo "Signed-in UPN:    $UPN"
     [[ -n "$OBJECT_ID" ]] && echo "Signed-in Obj ID: $OBJECT_ID"
     echo
 
-    # Microsoft Graph (Entra) — Global Admin template ID
-    local GA_TEMPLATE_ID="62e90394-69f5-4237-9190-012177145e10"  # Company Administrator
-
-    # 1) Find the directoryRole instance for Global Admin (must be activated in the tenant)
-    local roles_json role_id
-    if ! roles_json="$(
-        az rest \
-        --resource "https://graph.microsoft.com" \
-        --method GET \
-        --url "https://graph.microsoft.com/v1.0/directoryRoles?\$filter=roleTemplateId%20eq%20'$GA_TEMPLATE_ID'" \
-        -o json 2>/dev/null
-    )"; then
-        echo -e "${RED}Failed to query Microsoft Graph (directoryRoles).${NC}" >&2
-        echo "Tip: An admin may need to grant the Azure CLI app 'Read directory data' (Directory.Read.All) or 'RoleManagement.Read.Directory' in Entra ID."
-        return 2
+    if [[ -z "$OBJECT_ID" ]]; then
+        echo -e "${RED}Cannot resolve signed-in user's object ID.${NC}"
+        echo "Run: az login --tenant $TENANT_ID"
+        log_error "Cannot resolve signed-in user's object ID. Tenant checks cannot be fully evaluated."
+        print_final_summary
     fi
 
-    # Handle Graph errors
+    # Microsoft Graph / Entra Global Administrator role template ID
+    local GA_TEMPLATE_ID="62e90394-69f5-4237-9190-012177145e10"
+    local roles_json role_id ga_role_error_file ga_member_error_file
+
+    ga_role_error_file="$(mktemp)"
+
+    roles_json="$(
+        az rest \
+            --resource "https://graph.microsoft.com" \
+            --method GET \
+            --url "https://graph.microsoft.com/v1.0/directoryRoles?\$filter=roleTemplateId%20eq%20'$GA_TEMPLATE_ID'" \
+            -o json 2>"$ga_role_error_file"
+    )"
+
+    if [[ $? -ne 0 || -z "$roles_json" ]]; then
+        echo -e "${RED}Failed to query Microsoft Graph for Global Administrator role.${NC}"
+        echo "Tip: If you recently activated PIM, run: az logout && az login --tenant $TENANT_ID"
+        echo "Tip: The Azure CLI app may need delegated Graph consent such as Directory.Read.All or RoleManagement.Read.Directory."
+        [[ -s "$ga_role_error_file" ]] && cat "$ga_role_error_file"
+        rm -f "$ga_role_error_file"
+        log_error "Unable to verify Global Administrator role because Microsoft Graph directoryRoles query failed."
+        print_final_summary
+    fi
+
+    rm -f "$ga_role_error_file"
+
     if jq -e '.error' >/dev/null 2>&1 <<<"$roles_json"; then
-        echo -e "${RED}Graph error:${NC} $(jq -r '.error.message' <<<"$roles_json")" >&2
-        echo "Tip: Ask a Global Admin to grant admin consent for the Azure CLI app to read directory roles."
-        return 2
+        local graph_error
+        graph_error="$(jq -r '.error.message' <<<"$roles_json")"
+        echo -e "${RED}Graph error:${NC} $graph_error"
+        log_error "Unable to verify Global Administrator role. Graph error: $graph_error"
+        print_final_summary
     fi
 
     role_id="$(jq -r '.value[0].id // empty' <<<"$roles_json")"
+
     if [[ -z "$role_id" ]]; then
-        echo -e "${YELLOW}Global Administrator directory role is not activated in this tenant (unexpected).${NC}"
-        echo "Result: ${RED}NOT Global Admin${NC}"
-        return 1
+        echo -e "${RED}Global Administrator directory role is not activated or not readable in this tenant.${NC}"
+        log_error "Global Administrator directory role was not found or could not be read in tenant $TENANT_ID."
+        print_final_summary
     fi
 
-    # 2) Check if *current user* is a member of that directoryRole via me/checkMemberObjects
     local payload check_resp
     payload="$(jq -n --arg rid "$role_id" '{ids:[$rid]}')"
+    ga_member_error_file="$(mktemp)"
 
-    if ! check_resp="$(
+    check_resp="$(
         az rest \
-        --resource "https://graph.microsoft.com" \
-        --method POST \
-        --url "https://graph.microsoft.com/v1.0/me/checkMemberObjects" \
-        --headers "Content-Type=application/json" \
-        --body "$payload" \
-        -o json 2>/dev/null
-    )"; then
-        echo -e "${RED}Failed to query Microsoft Graph (me/checkMemberObjects).${NC}" >&2
-        echo "Tip: This typically requires Directory.Read.All or RoleManagement.Read.Directory (delegated) consent for the Azure CLI app."
-        return 2
+            --resource "https://graph.microsoft.com" \
+            --method POST \
+            --url "https://graph.microsoft.com/v1.0/me/checkMemberObjects" \
+            --headers "Content-Type=application/json" \
+            --body "$payload" \
+            -o json 2>"$ga_member_error_file"
+    )"
+
+    if [[ $? -ne 0 || -z "$check_resp" ]]; then
+        echo -e "${RED}Failed to query Microsoft Graph for current user's Global Administrator membership.${NC}"
+        echo "Tip: If you recently activated PIM, run: az logout && az login --tenant $TENANT_ID"
+        echo "Tip: This typically requires Directory.Read.All or RoleManagement.Read.Directory delegated consent for the Azure CLI app."
+        [[ -s "$ga_member_error_file" ]] && cat "$ga_member_error_file"
+        rm -f "$ga_member_error_file"
+        log_error "Unable to verify whether the signed-in user is Global Administrator."
+        print_final_summary
     fi
 
+    rm -f "$ga_member_error_file"
+
     if jq -e '.error' >/dev/null 2>&1 <<<"$check_resp"; then
-        echo -e "${RED}Graph error:${NC} $(jq -r '.error.message' <<<"$check_resp")" >&2
-        return 2
+        local graph_error
+        graph_error="$(jq -r '.error.message' <<<"$check_resp")"
+        echo -e "${RED}Graph error:${NC} $graph_error"
+        log_error "Unable to verify Global Administrator membership. Graph error: $graph_error"
+        print_final_summary
     fi
 
     if jq -e --arg rid "$role_id" '.value[]? | select(. == $rid)' >/dev/null 2>&1 <<<"$check_resp"; then
         echo -e "Result: ${GREEN}You ARE a Global Administrator in this tenant.${NC}"
-        
-        # return 0
+        log_pass "Signed-in user is a Global Administrator in tenant $TENANT_ID."
     else
         echo -e "Result: ${RED}You are NOT a Global Administrator in this tenant.${NC}"
-        echo -e "${NC}You can NOT onboard the Azure Tenant to Cortex Cloud.${NC}"
-        log_error "❌ User is NOT a Global Administrator.
-        You cannot onboard this tenant to Cortex Cloud."
-        # return 1
+        echo "You cannot onboard the Azure tenant to Cortex Cloud."
+        log_error "User is not a Global Administrator in tenant $TENANT_ID."
     fi
 
     echo
-    print_header "Checking Azure RBAC at root management group (\"Access management for Azure resources\")"
-    echo    
-    
-    if [[ -z "$OBJECT_ID" ]]; then
-        echo -e "${RED}Cannot resolve signed-in user's object id.${NC}" >&2
-        echo "Run: az login --tenant $TENANT_ID"
-        # return 2  # uncomment to fail hard
-    fi
+    print_header "Checking Tenant Root Group Management Group"
+    echo
 
-    # Find the root management group id (name field where parent is null)
-    local ROOTMG
-    ROOTMG="$(az account management-group list \
-        --query "[?properties.details.parent==null].name | [0]" -o tsv 2>/dev/null || true)"
+    local ROOTMG ROOT_MG_SCOPE
+    ROOTMG="$(
+        az account management-group list \
+            --query "[?properties.details.parent==null].name | [0]" \
+            -o tsv 2>/dev/null || true
+    )"
 
     if [[ -z "$ROOTMG" ]]; then
-        say "${RED}ERROR: Root Management Group not found.${NC}"
-        say "${YELLOW}\nTip: This usually indicates a **permissions issue** for viewing Azure Management Groups.${NC}"
-        say "${YELLOW}To successfully view Management Groups, ensure the following permissions are in place:${NC}"
-        say "${YELLOW}\n1. **Azure RBAC Roles (Required Minimum):** Your user must have at least the **'Contributor'** role assigned at the **Subscription** *and* **Management Group** level.${NC}"
-        say "${YELLOW}\n2. **Tenant Root Scope Access:** You must have an Azure RBAC role (e.g., 'Reader' or 'User Access Administrator') assigned at the **Tenant Root Scope ('/')**. This is the level *above* all subscriptions.${NC}"
-        say "${YELLOW}\n3. **Microsoft Entra ID Role (If initial setup is needed):** A **'Global Administrator'** role in Microsoft Entra ID may be required for the initial one-time enablement of Management Groups for the directory.${NC}"
-        log_error "Root Management Group not found or inaccessible. Unable to validate tenant root scope permissions."
-        # return 2  # uncomment to fail hard
+        echo -e "${YELLOW}⚠️ Root Management Group was not found or is not visible.${NC}"
+        echo "This may indicate missing permission to view Management Groups."
+        log_warning "Root Management Group was not found or inaccessible. Management Group visibility could not be validated."
     else
-        echo "Root management group: $ROOTMG"
-        # Look for 'User Access Administrator' at root MG for this principal
-        local UAA_JSON
-        UAA_JSON="$(az role assignment list \
-            --assignee-object-id "$OBJECT_ID" \
-            --scope "/providers/Microsoft.Management/managementGroups/$TENANT_ID" \
-            --include-inherited \
-            --query "[?roleDefinitionName=='User Access Administrator']" \
-            -o json 2>/dev/null || true)"
+        ROOT_MG_SCOPE="/providers/Microsoft.Management/managementGroups/$ROOTMG"
 
-        if jq -e 'length>0' >/dev/null 2>&1 <<<"$UAA_JSON"; then
-            echo -e "Result: ${GREEN}\"Access management for Azure resources\" is ENABLED for ${UPN:-this user} (User Access Administrator at root).${NC}"
-            # you can set a flag here, e.g., HAS_ROOT_UAA=1
-        else
-            echo -e "Result: ${RED}No 'User Access Administrator' assignment at root for ${UPN:-this user}.${NC}"
-            echo "Action: A Global Admin can toggle it in Entra ID → Properties → Access management for Azure resources (sign out/in)."
-            # HAS_ROOT_UAA=0
-        fi
+        echo -e "${GREEN}Root Management Group visible:${NC} $ROOTMG"
+        echo "Scope: $ROOT_MG_SCOPE"
+        log_pass "Root Management Group '$ROOTMG' is visible."
+
         echo
-        print_header "Checking Azure RBAC at tenant root scope (/) for Owner/Contributor"
+        print_header "Checking Azure RBAC Owner/Contributor at Tenant Root Group"
         echo
 
-        if [[ -z "$OBJECT_ID" ]]; then
-            echo -e "${YELLOW}Skipping tenant-level role check: Cannot resolve signed-in user's object id.${NC}" >&2
-            log_error "Unable to resolve the signed-in user's object id. Tenant root scope role check was skipped."
-        else
-            local TENANT_ROLES_JSON
-            TENANT_ROLES_JSON="$(az role assignment list \
+        local ROOT_MG_ROLES_JSON
+        ROOT_MG_ROLES_JSON="$(
+            az role assignment list \
                 --assignee-object-id "$OBJECT_ID" \
-                --scope "/providers/Microsoft.Management/managementGroups/$TENANT_ID" \
+                --scope "$ROOT_MG_SCOPE" \
                 --include-inherited \
                 --query "[?roleDefinitionName=='Owner' || roleDefinitionName=='Contributor']" \
-                -o json 2>/dev/null || true)"
+                -o json 2>/dev/null || true
+        )"
 
-            if jq -e 'length > 0' >/dev/null 2>&1 <<<"$TENANT_ROLES_JSON"; then
-                local assigned_roles
-                assigned_roles=$(jq -r '[.[] | .roleDefinitionName] | unique | join(", ")' <<<"$TENANT_ROLES_JSON")
-                echo -e "Result: ${GREEN}User HAS required tenant-level role(s) ($assigned_roles) at scope '/'.${NC}"
-            else
-                echo -e "Result: ${RED}User does NOT have 'Owner' or 'Contributor' assignment at the tenant root scope ('/').${NC}"
-                echo "Action: An existing user with sufficient privileges must assign 'Owner' or 'Contributor' to '${UPN:-this user}' at the tenant root scope."
-                log_error "Missing 'Owner' or 'Contributor' assignment at the tenant root scope ('/') for ${UPN:-this user}."
-            fi
+        if jq -e 'length > 0' >/dev/null 2>&1 <<<"$ROOT_MG_ROLES_JSON"; then
+            local assigned_root_mg_roles
+            assigned_root_mg_roles="$(jq -r '[.[] | .roleDefinitionName] | unique | join(", ")' <<<"$ROOT_MG_ROLES_JSON")"
+
+            echo -e "Result: ${GREEN}User has required Azure RBAC role(s) at Tenant Root Group: $assigned_root_mg_roles.${NC}"
+            log_pass "User has Azure RBAC role(s) at Tenant Root Group '$ROOTMG': $assigned_root_mg_roles."
+        else
+            echo -e "Result: ${RED}User does NOT have Owner or Contributor at Tenant Root Group.${NC}"
+            echo "Action: Assign Owner or Contributor to '${UPN:-this user}' at the Tenant Root Group management group if tenant-wide onboarding requires it."
+            log_error "Missing Owner or Contributor assignment at Tenant Root Group '$ROOTMG' for ${UPN:-this user}."
         fi
     fi
 
-    #final summary
-    if [ "$HAS_ERRORS" = true ]; then
-    echo -e "\n${RED}🔴 VALIDATION FAILED — Found ${#ERRORS[@]} issue(s):${NC}"
+    echo
+    print_header "Checking Azure RBAC at tenant root scope (/)"
+    echo
 
-    for err in "${ERRORS[@]}"; do
-        echo -e "\n$err"
-    done
+    local ROOT_SCOPE="/"
 
-    echo -e "\n${YELLOW}Please fix the issues above and re-run the script.${NC}\n"
-    exit 1
+    echo "Checking User Access Administrator at tenant root scope: $ROOT_SCOPE"
+
+    local UAA_JSON
+    UAA_JSON="$(
+        az role assignment list \
+            --assignee-object-id "$OBJECT_ID" \
+            --scope "$ROOT_SCOPE" \
+            --include-inherited \
+            --query "[?roleDefinitionName=='User Access Administrator']" \
+            -o json 2>/dev/null || true
+    )"
+
+    if jq -e 'length > 0' >/dev/null 2>&1 <<<"$UAA_JSON"; then
+        echo -e "Result: ${GREEN}User has User Access Administrator at tenant root scope (/).${NC}"
+        log_pass "User has User Access Administrator at tenant root scope (/)."
     else
-        echo -e "\n${GREEN}✅ All checks passed successfully!${NC}\n"
-    fi    
+        echo -e "Result: ${YELLOW}User does not have User Access Administrator at tenant root scope (/).${NC}"
+        echo "Action: A Global Administrator can enable Entra ID → Properties → Access management for Azure resources, then sign out/in."
+        log_warning "User does not have User Access Administrator at tenant root scope (/). This may affect ability to assign Azure RBAC across the tenant."
+    fi
+
+    echo
+    print_header "Checking Owner/Contributor at tenant root scope (/)"
+    echo
+
+    local TENANT_ROOT_ROLES_JSON
+    TENANT_ROOT_ROLES_JSON="$(
+        az role assignment list \
+            --assignee-object-id "$OBJECT_ID" \
+            --scope "$ROOT_SCOPE" \
+            --include-inherited \
+            --query "[?roleDefinitionName=='Owner' || roleDefinitionName=='Contributor']" \
+            -o json 2>/dev/null || true
+    )"
+
+    if jq -e 'length > 0' >/dev/null 2>&1 <<<"$TENANT_ROOT_ROLES_JSON"; then
+        local assigned_tenant_root_roles
+        assigned_tenant_root_roles="$(jq -r '[.[] | .roleDefinitionName] | unique | join(", ")' <<<"$TENANT_ROOT_ROLES_JSON")"
+
+        echo -e "Result: ${GREEN}User has Owner/Contributor at tenant root scope (/): $assigned_tenant_root_roles.${NC}"
+        log_pass "User has Owner/Contributor at tenant root scope (/): $assigned_tenant_root_roles."
+    else
+        echo -e "Result: ${YELLOW}User does not have Owner or Contributor at tenant root scope (/).${NC}"
+        echo "This is usually not the same as the Tenant Root Group IAM screen in the Azure Portal."
+        log_warning "User does not have Owner or Contributor at tenant root scope (/). This may be acceptable if required access exists at the Tenant Root Group management group."
+    fi
+
+    print_final_summary
 }
+
 gcp_project_check() {
     echo
     print_header "Starting GCP Project Preflight Permissions Check"
@@ -2263,121 +1764,170 @@ gcp_org_check() {
     ACCOUNT="$(gcloud config get-value account 2>/dev/null)"
     [[ -n "$ACCOUNT" ]] || { echo "Cannot resolve current account (gcloud auth)." >&2; return 2; }
 
-    # resolve organization id (numeric); prefer $GCP_ORG_ID if set, else auto-pick, else prompt
+    # resolve organization id
     local ORG_ID ORG_NUM
+    local -a _orgs
     ORG_ID="${GCP_ORG_ID:-}"
+
     if [[ -z "$ORG_ID" ]]; then
-        mapfile -t _orgs < <(gcloud organizations list --format="value(ID)" 2>/dev/null || true)
+        _orgs=()
+        while IFS= read -r line; do
+            [[ -n "$line" ]] && _orgs+=("$line")
+        done < <(gcloud organizations list --format="value(ID)" 2>/dev/null || true)
+
         if ((${#_orgs[@]} == 1)); then
             ORG_ID="${_orgs[0]}"
         else
             echo
-            echo -e "${RED}Failed fetching Organization data.${NC} You can't onboard this GCP Organization."
-            echo
-            exit 1
+            echo -e "${YELLOW}Could not auto-detect exactly one GCP Organization.${NC}"
+            echo "Detected organizations: ${#_orgs[@]}"
+            read -rp "Enter GCP Organization ID (numeric, e.g. 123456789012): " ORG_ID
         fi
     fi
-    if [[ -z "$ORG_ID" ]]; then
-        read -rp "Enter GCP Organization ID (numeric, e.g. 123456789012): " ORG_ID
-    fi
+
+    ORG_ID="$(echo "$ORG_ID" | xargs)"
     [[ -n "$ORG_ID" ]] || { echo "Empty organization id" >&2; return 2; }
-    ORG_NUM="${ORG_ID#organizations/}"   # normalize if user passed "organizations/1234"
+
+    ORG_NUM="${ORG_ID#organizations/}"
 
     echo "Organization: organizations/${ORG_NUM}"
     echo "Account:      ${ACCOUNT}"
     echo
 
-    # quick existence / access sanity (best-effort)
     # --- Organization Policy Check: constraints/iam.allowedPolicyMemberDomains ---
-    # This org policy can restrict which identity domains may be added to IAM policies.
-    # If configured, onboarding Cortex Cloud service accounts/groups outside the allowed domains
-    # may fail. We surface a warning with the configured values.
-    if gcloud org-policies describe constraints/iam.allowedPolicyMemberDomains \
-         --organization "${ORG_NUM}" --format=json >/tmp/_iam_domain_policy.json 2>/dev/null; then
+    echo "Checking org policy constraints/iam.allowedPolicyMemberDomains..."
 
-        # Parse both Org Policy v1 (listPolicy) and v2 (spec.rules[].values)
+    local ORG_POLICY_JSON ORG_POLICY_ERR
+    ORG_POLICY_JSON="$(mktemp)"
+    ORG_POLICY_ERR="$(mktemp)"
+
+    if gcloud org-policies describe constraints/iam.allowedPolicyMemberDomains \
+        --organization "${ORG_NUM}" \
+        --format=json >"${ORG_POLICY_JSON}" 2>"${ORG_POLICY_ERR}"; then
+
         local _allowed_json _denied_json _all_values _has_restriction
         _allowed_json="$(jq -r '
-            if .spec and (.spec.rules // []) | length > 0 then
+            if (.spec and ((.spec.rules // []) | length > 0)) then
               [ .spec.rules[]? | .values.allowedValues[]? ] | unique
             elif .listPolicy then
               (.listPolicy.allowedValues // [])
-            else [] end
-          ' /tmp/_iam_domain_policy.json)"
+            else
+              []
+            end
+        ' "${ORG_POLICY_JSON}")"
+
         _denied_json="$(jq -r '
-            if .spec and (.spec.rules // []) | length > 0 then
+            if (.spec and ((.spec.rules // []) | length > 0)) then
               [ .spec.rules[]? | .values.deniedValues[]? ] | unique
             elif .listPolicy then
               (.listPolicy.deniedValues // [])
-            else [] end
-          ' /tmp/_iam_domain_policy.json)"
-        _all_values="$(jq -r '
-            if .listPolicy and .listPolicy.allValues then .listPolicy.allValues
-            else empty end
-          ' /tmp/_iam_domain_policy.json)"
+            else
+              []
+            end
+        ' "${ORG_POLICY_JSON}")"
 
-        # Determine if policy is effectively restricting
-        _has_restriction=
+        _all_values="$(jq -r '
+            if (.listPolicy and .listPolicy.allValues) then
+              .listPolicy.allValues
+            else
+              empty
+            end
+        ' "${ORG_POLICY_JSON}")"
+
+        _has_restriction=""
+
         if [[ -n "$_all_values" && "$_all_values" != "ALLOW" ]]; then
             _has_restriction=1
         fi
-        if jq -e 'length>0' <<<"$_allowed_json" >/dev/null 2>&1; then
+
+        if jq -e 'length > 0' <<<"$_allowed_json" >/dev/null 2>&1; then
             _has_restriction=1
         fi
-        if jq -e 'length>0' <<<"$_denied_json" >/dev/null 2>&1; then
+
+        if jq -e 'length > 0' <<<"$_denied_json" >/dev/null 2>&1; then
             _has_restriction=1
         fi
 
         if [[ -n "$_has_restriction" ]]; then
             echo -e "${YELLOW}Note:${NC} Org Policy ${BOLD}constraints/iam.allowedPolicyMemberDomains${NC} is configured."
-            if jq -e 'length>0' <<<"$_allowed_json" >/dev/null 2>&1; then
+
+            if jq -e 'length > 0' <<<"$_allowed_json" >/dev/null 2>&1; then
                 echo "  Allowed member domains:"
                 jq -r '.[]' <<<"$_allowed_json" | sed 's/^/    - /'
             fi
-            if jq -e 'length>0' <<<"$_denied_json" >/dev/null 2>&1; then
+
+            if jq -e 'length > 0' <<<"$_denied_json" >/dev/null 2>&1; then
                 echo "  Denied member domains:"
                 jq -r '.[]' <<<"$_denied_json" | sed 's/^/    - /'
             fi
+
             if [[ -n "$_all_values" && "$_all_values" != "ALLOW" ]]; then
                 echo "  allValues: ${_all_values}"
             fi
+
             echo -e "${YELLOW}Warning:${NC} This policy may block onboarding between GCP and Cortex Cloud if required identities are not within the allowed domains."
-            echo "          Consider temporarily relaxing or adding the necessary domains during onboarding."
+            echo "          Consider temporarily relaxing the policy or adding the necessary domains during onboarding."
         else
-            echo -e "${GREEN}Org Policy present but not restricting domains (no allowed/denied list and allValues=ALLOW).${NC}"
+            echo -e "${GREEN}Org Policy present but not restricting domains.${NC}"
         fi
-        rm -f /tmp/_iam_domain_policy.json
+
     else
-        echo -e "${GREEN}No organization policy found for constraints/iam.allowedPolicyMemberDomains (not configured).${NC}"
+        echo -e "${YELLOW}Warning:${NC} Could not read constraints/iam.allowedPolicyMemberDomains."
+
+        if [[ -s "${ORG_POLICY_ERR}" ]]; then
+            echo "gcloud error:"
+            head -c 1000 "${ORG_POLICY_ERR}"
+            echo
+        fi
+
+        echo "Continuing with permission checks..."
     fi
+
+    rm -f "${ORG_POLICY_JSON}" "${ORG_POLICY_ERR}"
     # --- End Organization Policy Check ---
 
     if ! gcloud organizations describe "organizations/${ORG_NUM}" >/dev/null 2>&1; then
-        echo -e "${YELLOW}Warning:${NC} Unable to describe organization (may lack resourcemanager.organizations.get). Continuing with permission checks..."
+        echo -e "${YELLOW}Warning:${NC} Unable to describe organization. You may lack resourcemanager.organizations.get. Continuing with permission checks..."
     fi
 
     # build required permissions from predefined arrays
     local -a req_perms
     req_perms=("${PERMISSIONS_GCP_ORG_BASE[@]}")
 
+    local audts=0
     echo "Enable additional org-level audit/diagnostics permissions (if required by your template)?"
     read -rp "Answer y/n: " audit_logs
+
     case "$audit_logs" in
-        y|Y) req_perms+=("${PERMISSIONS_GCP_ORG_AUDIT_LOGS[@]}") ;;
+        y|Y)
+            req_perms+=("${PERMISSIONS_GCP_ORG_AUDIT_LOGS[@]}")
+            audts=1
+            ;;
     esac
 
     # de-dup + strip empties
-    mapfile -t req_perms < <(printf '%s\n' "${req_perms[@]}" | awk 'NF' | sort -u)
+    local -a req_perms_dedup=()
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && req_perms_dedup+=("$line")
+    done < <(printf '%s\n' "${req_perms[@]}" | awk 'NF' | sort -u)
+    req_perms=("${req_perms_dedup[@]}")
 
     if ((${#req_perms[@]} == 0)); then
-        echo -e "${YELLOW}No GCP org permissions listed to check (arrays are empty).${NC}"
+        echo -e "${YELLOW}No GCP org permissions listed to check. Permission arrays are empty.${NC}"
         return 0
     fi
 
     # access token
     local ACCESS_TOKEN
-    ACCESS_TOKEN="$(gcloud auth print-access-token 2>/dev/null)" || { echo "Failed to get access token" >&2; return 2; }
-    [[ -n "$ACCESS_TOKEN" ]] || { echo "Empty access token" >&2; return 2; }
+    ACCESS_TOKEN="$(gcloud auth print-access-token 2>/dev/null)" || {
+        echo "Failed to get access token" >&2
+        return 2
+    }
+
+    [[ -n "$ACCESS_TOKEN" ]] || {
+        echo "Empty access token" >&2
+        return 2
+    }
 
     # function to call testIamPermissions in batches
     local -a missing=() granted_batch=()
@@ -2388,7 +1938,6 @@ gcp_org_check() {
         json_perms="$(printf '%s\n' "${batch[@]}" | jq -R . | jq -s .)"
         payload="$(jq -n --argjson perms "$json_perms" '{permissions:$perms}')"
 
-        # using org endpoint.
         resource="https://cloudresourcemanager.googleapis.com/v1/organizations/${ORG_NUM}"
 
         resp="$(curl -sS -X POST \
@@ -2402,49 +1951,58 @@ gcp_org_check() {
             local code msg
             code="$(jq -r '.error.code // empty' <<<"$resp")"
             msg="$(jq -r '.error.message // empty' <<<"$resp")"
+
             echo -e "${RED}Error from testIamPermissions:${NC} ${msg:-unknown} (code ${code:-?})" >&2
-            # if the error is 'PERMISSION_DENIED', it means the API call worked but the user lacks permissions.
-            # qe can treat this as a "check complete" but with no permissions granted.
+
             if [[ "$code" == "403" || "$code" == "7" ]]; then
-                # PERMISSION_DENIED (7) or HTTP 403
-                # add all permissions in this batch to the missing list
                 missing+=("${batch[@]}")
                 return 0
             fi
+
             return 3
         fi
 
-        mapfile -t granted_batch < <(jq -r '.permissions[]?' <<<"$resp")
-        # mark any not returned as missing
+        granted_batch=()
+        while IFS= read -r line; do
+            [[ -n "$line" ]] && granted_batch+=("$line")
+        done < <(jq -r '.permissions[]?' <<<"$resp")
+
         local p had g
         for p in "${batch[@]}"; do
             had=""
             for g in "${granted_batch[@]}"; do
-            [[ "$p" == "$g" ]] && { had=1; break; }
+                [[ "$p" == "$g" ]] && { had=1; break; }
             done
+
             [[ -z "$had" ]] && missing+=("$p")
         done
+
         return 0
     }
 
-    # run in batches (keep comfortably under body limits)
+    # run in batches
     local i step=90
     for ((i=0; i<${#req_perms[@]}; i+=step)); do
-        _test_org_batch "${req_perms[@]:i:step}" || { echo "Permission probe failed." >&2; return 2; }
+        _test_org_batch "${req_perms[@]:i:step}" || {
+            echo "Permission probe failed." >&2
+            return 2
+        }
     done
+
     echo
     print_header "Preflight Permissions Check Summary"
     echo
-    echo "Based on the selected options: " 
-    (( audts == 0 )) && echo "- Audit Logs disabled" || echo "Audit Logs enabled"
+    echo "Based on the selected options:"
+    (( audts == 0 )) && echo "- Audit Logs disabled" || echo "- Audit Logs enabled"
     echo
     echo "Scope: organizations/${ORG_NUM}"
     echo
+
     if ((${#missing[@]} == 0)); then
         echo -e "${GREEN}Permissions OK${NC} — all required GCP organization permissions are granted."
         printf '  - %s\n' "${req_perms[@]}"
         echo
-        echo "You can Onboard this GCP Orgnazation to Cortex Cloud."
+        echo "You can onboard this GCP Organization to Cortex Cloud."
         return 0
     else
         echo -e "${RED}Missing organization permissions:${NC}"
