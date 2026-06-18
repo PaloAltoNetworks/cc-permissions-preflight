@@ -18,18 +18,21 @@ Run the script from the matching cloud shell. If you run it locally, install and
 ### AWS
 - You are testing the same identity you will use for onboarding. For AWS Orgs, this should be tested in the master payer.
 - If you're running the script in CloudShell you'll need the required permissions to do so. 
-- For AWS Organization check, you must belong to the organization and have this permission: 'organizations:DescribeOrganization'
+- For AWS Organization check, you must belong to the organization and have this permission: `organizations:DescribeOrganization`
 
 ### Azure
-- **Before running any Azure commands, the user must authenticate their session. Advise the customer to execute the following commands in their terminal:** 
-  - **Login to Azure:**
-    - **Bash**
-    - **az login**
+- Before running any Azure commands, the user must login and authenticate their session. Execute the following commands in their terminal:
+     ```bash
+    az login
+    ```
 
-- Set the subscription you want to test: az account set --subscription "<SUBSCRIPTION_ID>"
+- Set the subscription you want to test:
+  ```bash
+  az account set --subscription "<SUBSCRIPTION_ID>"
+  ```
 - The identity needs to be able to read role assignments/definitions (e.g., Microsoft.Authorization/roleAssignments/read, .../roleDefinitions/read)
   - For Azure tenant, the identity needs to be able to read roles at Entra ID level and integrate with Microsoft Graph.
-  - This is only to see if you have permissions to onboard Management Groups and Subscriptions from a tenant that already has the enterprise application approved.
+  - This is necessary to see if you have permissions to onboard Management Groups and Subscriptions from a tenant that already has the enterprise application approved.
   - Azure RBAC Permissions (Data Retrieval):
     - The identity must have at least the Contributor role assigned at both the Management Group and Subscription levels.
     - This grants the necessary rights to read role assignments/definitions (e.g., Microsoft.Authorization/roleAssignments/read) across your resources.
@@ -38,7 +41,10 @@ Run the script from the matching cloud shell. If you run it locally, install and
     - This is required for reading roles at the Entra ID level and integrating with the Microsoft Graph API, which is essential for the initial enablement or approval of the required Enterprise Application.
 
 ### GCP
-- Set project for project checks: gcloud config set project <PROJECT_ID>
+- Set project for project checks:
+  ```bash
+  gcloud config set project <PROJECT_ID>
+  ```
 - For org checks, know your numeric Organization ID (e.g., 123456789012)
 
 ## Quickstart (Cloud Shell one-liner)
