@@ -21,7 +21,7 @@ Run the script from the matching cloud shell. If you run it locally, install and
 - For AWS Organization check, you must belong to the organization and have this permission: `organizations:DescribeOrganization`
 
 ### Azure
-- Before running any Azure commands, the user must login and authenticate their session. Execute the following commands in their terminal:
+- Before running any Azure commands, the user must login and authenticate their session. Execute the following commands in the cloud shell terminal:
      ```bash
     az login
     ```
