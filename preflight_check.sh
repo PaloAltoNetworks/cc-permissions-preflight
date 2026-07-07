@@ -202,31 +202,45 @@ PERMISSIONS_AWS_ACCOUNT_BASE=(
     "lambda:GetFunction"
     "lambda:InvokeFunction"
 )
+
 PERMISSIONS_AWS_ACCOUNT_AUDIT_LOGS=(
-    "SNS:GetTopicAttributes"
-    "sqs:createqueue"
-    "SNS:CreateTopic"
-    "SNS:TagResource"
-    "sqs:tagqueue"
+    "sns:GetTopicAttributes"
+    "sqs:CreateQueue"
+    "sns:CreateTopic"
+    "sns:TagResource"
+    "sqs:TagQueue"
     "kms:TagResource"
     "kms:CreateKey"
     "kms:PutKeyPolicy"
-    "SNS:SetTopicAttributes"
+    "sns:SetTopicAttributes"
     "s3:PutBucketTagging"
     "s3:PutEncryptionConfiguration"
     "s3:PutLifecycleConfiguration"
-    "sqs:setqueueattributes"
-    "SNS:Subscribe"
+    "sqs:SetQueueAttributes"
+    "sns:Subscribe"
     "iam:PutRolePolicy"
     "s3:PutBucketPolicy"
     "cloudtrail:CreateTrail"
     "cloudtrail:AddTags"
     "cloudtrail:StartLogging"
     "cloudtrail:PutEventSelectors"
+    # --- ADDED FOR RUNTIME LOG INGESTION & BUCKET CLEANUP ---
+    "kms:Decrypt"
+    "s3:GetObject"
+    "s3:ListBucket"
+    "s3:DeleteObject"
+    "s3:DeleteObjectVersion"
+    "sqs:ReceiveMessage"
+    "sqs:DeleteMessage"
+    "sqs:ChangeMessageVisibility"
+    "sqs:GetQueueAttributes"
 )
+
 PERMISSIONS_AWS_ACCOUNT_FEATURES=(
     "iam:PutRolePolicy"
+    "iam:CreatePolicy"
 )
+
 PERMISSIONS_AWS_ORG_BASE=(
     "cloudformation:CreateUploadBucket"
     "cloudformation:CreateStack"
@@ -252,39 +266,52 @@ PERMISSIONS_AWS_ORG_BASE=(
     "cloudformation:CreateStackSet"
     "cloudformation:CreateStackInstances"
     "cloudformation:DescribeStackSetOperation"
+    # --- ADDED FOR ORG SCOPE BASE ONBOARDING LAMBDA ---
+    "organizations:DescribeOrganization"
 )
+
 PERMISSIONS_AWS_ORG_AUDIT_LOGS=(
-    "SNS:GetTopicAttributes"
-    "sqs:createqueue"
-    "SNS:CreateTopic"
-    "SNS:TagResource"
-    "sqs:tagqueue"
+    "sns:GetTopicAttributes"
+    "sqs:CreateQueue"
+    "sns:CreateTopic"
+    "sns:TagResource"
+    "sqs:TagQueue"
     "kms:TagResource"
     "kms:CreateKey"
     "kms:PutKeyPolicy"
-    "SNS:SetTopicAttributes"
+    "sns:SetTopicAttributes"
     "s3:PutBucketTagging"
     "s3:PutEncryptionConfiguration"
     "s3:PutLifecycleConfiguration"
-    "sqs:setqueueattributes"
-    "SNS:Subscribe"
+    "sqs:SetQueueAttributes"
+    "sns:Subscribe"
     "iam:PutRolePolicy"
     "s3:PutBucketPolicy"
     "cloudtrail:CreateTrail"
     "cloudtrail:AddTags"
     "cloudtrail:StartLogging"
     "cloudtrail:PutEventSelectors"
-    "sqs:getqueueattributes"
+    "sqs:GetQueueAttributes"
     "cloudformation:CreateStackSet"
     "cloudformation:CreateStackInstances"
     "cloudformation:DescribeStackSetOperation"
-    "sqs:getqueueattributes"
     "organizations:ListAWSServiceAccessForOrganization"
     "organizations:DescribeOrganization"
     "organizations:DescribeOrganizationalUnit"
+    # --- ADDED FOR RUNTIME LOG INGESTION & BUCKET CLEANUP ---
+    "kms:Decrypt"
+    "s3:GetObject"
+    "s3:ListBucket"
+    "s3:DeleteObject"
+    "s3:DeleteObjectVersion"
+    "sqs:ReceiveMessage"
+    "sqs:DeleteMessage"
+    "sqs:ChangeMessageVisibility"
 )
+
 PERMISSIONS_AWS_ORG_FEATURES=(
     "iam:PutRolePolicy"
+    "iam:CreatePolicy"
 )
 PERMISSIONS_AZURE_SUBSCRIPTION_BASE=(
     "Microsoft.Resources/subscriptions/read"
@@ -482,36 +509,163 @@ PERMISSIONS_GCP_ORG_AUDIT_LOGS=(
 )
 
 # Functions
+resolve_aws_principal_arn() {
+    local identity_arn="$1"
+    local role_name
+    local role_arn
+
+    if [[ "$identity_arn" == *":user/"* ]]; then
+        printf '%s\n' "$identity_arn"
+        return 0
+    fi
+
+    if [[ "$identity_arn" == *":assumed-role/"* ]]; then
+        role_name="${identity_arn#*:assumed-role/}"
+        role_name="${role_name%%/*}"
+
+        if ! role_arn=$(aws iam get-role \
+            --role-name "$role_name" \
+            --query "Role.Arn" \
+            --output text 2>&1); then
+            echo "Unable to resolve IAM role '$role_name': $role_arn" >&2
+            return 1
+        fi
+
+        if [[ -z "$role_arn" || "$role_arn" == "None" ]]; then
+            echo "AWS returned an empty ARN for IAM role '$role_name'." >&2
+            return 1
+        fi
+
+        printf '%s\n' "$role_arn"
+        return 0
+    fi
+
+    echo "Unsupported identity type: $identity_arn" >&2
+    return 1
+}
+
+check_aws_actions() {
+    local entity_arn="$1"
+    shift
+
+    local action
+    local candidate
+    local duplicate
+    local result
+    local error_summary
+    local -a unique_actions=()
+
+    DENIED_ACTIONS=()
+    AWS_VERIFICATION_ERRORS=()
+
+    # Base, audit-log, and feature permission sets intentionally overlap.
+    # Simulate each required action only once after the selected sets are merged.
+    for candidate in "$@"; do
+        duplicate=0
+        for action in "${unique_actions[@]}"; do
+            if [[ "$action" == "$candidate" ]]; then
+                duplicate=1
+                break
+            fi
+        done
+
+        if [ "$duplicate" -eq 0 ]; then
+            unique_actions+=("$candidate")
+        fi
+    done
+
+    for action in "${unique_actions[@]}"; do
+        if result=$(aws iam simulate-principal-policy \
+            --policy-source-arn "$entity_arn" \
+            --action-names "$action" \
+            --query "EvaluationResults[0].EvalDecision" \
+            --output text 2>&1); then
+            case "$result" in
+                allowed|Allowed)
+                    echo -e "$action: ${GREEN}Allowed${NC}"
+                    ;;
+                explicitDeny|ExplicitDeny)
+                    echo -e "$action: ${RED}Explicitly denied${NC}"
+                    DENIED_ACTIONS+=("$action")
+                    ;;
+                implicitDeny|ImplicitDeny)
+                    echo -e "$action: ${RED}Implicitly denied${NC}"
+                    DENIED_ACTIONS+=("$action")
+                    ;;
+                *)
+                    echo -e "$action: ${YELLOW}Unable to verify (unexpected result: $result)${NC}"
+                    AWS_VERIFICATION_ERRORS+=("$action: unexpected simulator result '$result'")
+                    ;;
+            esac
+        else
+            error_summary="$(printf '%s' "$result" | tr '\n' ' ' | fold -w 300 | head -n 1)"
+            echo -e "$action: ${YELLOW}Unable to verify${NC}"
+            AWS_VERIFICATION_ERRORS+=("$action: ${error_summary:-unknown AWS CLI error}")
+        fi
+    done
+}
+
+print_aws_permission_results() {
+    if [ "${#DENIED_ACTIONS[@]}" -eq 0 ] && [ "${#AWS_VERIFICATION_ERRORS[@]}" -eq 0 ]; then
+        echo -e "${GREEN}You have the required permissions.${NC}"
+        return 0
+    fi
+
+    if [ "${#DENIED_ACTIONS[@]}" -gt 0 ]; then
+        echo -e "${RED}Missing permissions:${NC}"
+        local permission
+        for permission in "${DENIED_ACTIONS[@]}"; do
+            echo "   - $permission"
+        done
+        echo
+    fi
+
+    if [ "${#AWS_VERIFICATION_ERRORS[@]}" -gt 0 ]; then
+        echo -e "${YELLOW}Permissions that could not be verified:${NC}"
+        local verification_error
+        for verification_error in "${AWS_VERIFICATION_ERRORS[@]}"; do
+            echo "   - $verification_error"
+        done
+        echo
+        echo "These are AWS CLI or IAM simulator errors, not confirmed missing permissions."
+    fi
+
+    return 1
+}
+
 aws_account_check() {
     echo
     print_header "Starting AWS Single Account Preflight Permissions Check"
     echo
-    
-    set -e
 
-    ACCOUNT_ID=$(aws sts get-caller-identity --query "Account" --output text)
-    IDENTITY_ARN=$(aws sts get-caller-identity --query "Arn" --output text)
+    local ACCOUNT_ID
+    local IDENTITY_ARN
+    local ENTITY_ARN
+
+    if ! ACCOUNT_ID=$(aws sts get-caller-identity --query "Account" --output text 2>&1); then
+        echo -e "${RED}Unable to determine the current AWS account: $ACCOUNT_ID${NC}"
+        return 1
+    fi
+
+    if ! IDENTITY_ARN=$(aws sts get-caller-identity --query "Arn" --output text 2>&1); then
+        echo -e "${RED}Unable to determine the current AWS identity: $IDENTITY_ARN${NC}"
+        return 1
+    fi
 
     echo "Current identity ARN: $IDENTITY_ARN"
 
-    # Detect principal ARN
-    if [[ "$IDENTITY_ARN" == *":user/"* ]]; then
-        ENTITY_ARN="$IDENTITY_ARN"
-    elif [[ "$IDENTITY_ARN" == *":assumed-role/"* ]]; then
-        ROLE_NAME=$(echo "$IDENTITY_ARN" | awk -F'/' '{print $2}')
-        ENTITY_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
-    elif [[ "$IDENTITY_ARN" == *":root" ]]; then
+    if [[ "$IDENTITY_ARN" == *":root" ]]; then
         echo "Detected CloudShell root ARN — All permissions are satisfied"
-        exit 0
-    else
-        echo "Unsupported identity type: $IDENTITY_ARN"
-        exit 1
+        return 0
+    fi
+
+    if ! ENTITY_ARN=$(resolve_aws_principal_arn "$IDENTITY_ARN"); then
+        return 1
     fi
 
     echo "Simulating permissions for: $ENTITY_ARN"
     echo
 
-    DENIED_ACTIONS=()
     aws_single_actions=("${PERMISSIONS_AWS_ACCOUNT_BASE[@]}")
 
     local audts=0
@@ -542,24 +696,8 @@ aws_account_check() {
 
     echo
 
-    # Check each action
-    for ACTION in "${aws_single_actions[@]}"; do
-        RESULT=$(aws iam simulate-principal-policy \
-            --policy-source-arn "$ENTITY_ARN" \
-            --action-names "$ACTION" \
-            --query "EvaluationResults[0].EvalDecision" \
-            --output text 2>/dev/null || echo "ERROR")
+    check_aws_actions "$ENTITY_ARN" "${aws_single_actions[@]}"
 
-        if [[ "$RESULT" =~ ^[Aa]llowed$ ]]; then
-            echo -e "$ACTION: ${GREEN}Allowed${NC}"
-        elif [[ "$RESULT" =~ ^[Dd]enied$ ]]; then
-            echo -e "$ACTION: ${RED}Denied${NC}"
-            DENIED_ACTIONS+=("$ACTION")
-        else
-            echo "$ACTION Failed verifying this permission."
-            DENIED_ACTIONS+=("$ACTION")
-        fi
-    done
     echo
     print_header "Preflight Permissions Check Summary"
     echo
@@ -570,16 +708,14 @@ aws_account_check() {
     echo "- Identity ARN: $IDENTITY_ARN"
     echo "- ACCOUNT ID: $ACCOUNT_ID"
     echo
-    if [ ${#DENIED_ACTIONS[@]} -eq 0 ]; then
-        echo -e "${GREEN}You have the required permissions.${NC}"
-    else
-        echo -e "${RED} Missing permissions:${NC}"
-        for PERM in "${DENIED_ACTIONS[@]}"; do
-            echo "   - $PERM"
-        done
-        echo 
-        echo "Please contact an administrator to enable those permissions."
-        exit 1
+    if ! print_aws_permission_results; then
+        if [ "${#DENIED_ACTIONS[@]}" -gt 0 ]; then
+            echo "Please contact an administrator to enable the denied permissions."
+        fi
+        if [ "${#AWS_VERIFICATION_ERRORS[@]}" -gt 0 ]; then
+            echo "Resolve the verification errors above and re-run the preflight check."
+        fi
+        return 1
     fi
 }
 aws_organization_check() {
@@ -587,55 +723,65 @@ aws_organization_check() {
     print_header "Starting AWS Organization Preflight Permissions Check"
     echo
 
-    set -e
+    local ACCOUNT_ID
+    local IDENTITY_ARN
+    local ENTITY_ARN
+    local ORG_ID
+    local ORG_ERROR
+    local ORG_CHECK_FAILED=0
 
-    local ACCOUNT_ID=$(aws sts get-caller-identity --query "Account" --output text)
-    local IDENTITY_ARN=$(aws sts get-caller-identity --query "Arn" --output text)
+    if ! ACCOUNT_ID=$(aws sts get-caller-identity --query "Account" --output text 2>&1); then
+        echo -e "${RED}Unable to determine the current AWS account: $ACCOUNT_ID${NC}"
+        return 1
+    fi
+
+    if ! IDENTITY_ARN=$(aws sts get-caller-identity --query "Arn" --output text 2>&1); then
+        echo -e "${RED}Unable to determine the current AWS identity: $IDENTITY_ARN${NC}"
+        return 1
+    fi
+
     echo "Current identity ARN: $IDENTITY_ARN"
     echo
 
-    echo "Checking AWS Organization Master Account"
+    echo "Checking AWS Organization Management Account"
 
-    local ORG_ID=$(aws organizations describe-organization --query 'Organization.MasterAccountId' --output text)
-
-    if [[ "$ACCOUNT_ID" == "$ORG_ID" ]]; then
+    if ORG_ID=$(aws organizations describe-organization \
+        --query 'Organization.ManagementAccountId || Organization.MasterAccountId' \
+        --output text 2>&1); then
+        if [[ "$ACCOUNT_ID" == "$ORG_ID" ]]; then
+            echo
+            echo "Organization management account session detected"
+        else
+            echo
+            echo -e "${RED}AWS Organization management account not detected.${NC}"
+            echo "Please log in to the management account and make sure you have permissions over the Organization."
+            echo "- organizations:DescribeOrganization"
+            echo "- organizations:DescribeOrganizationalUnit"
+            echo
+            return 1
+        fi
+    else
+        ORG_ERROR="$ORG_ID"
+        ORG_ID="Unknown"
+        ORG_CHECK_FAILED=1
         echo
-        echo "Master Account session detected"
-    elif [[ "$ORG_ID" == *"AccessDeniedException"* ]]; then
-        echo
-        echo "Unable to detect master account session due to lack of permissions."
-        echo "You won't be able to onboard AWS Organization from a Non-Master Organization Account"
+        echo -e "${YELLOW}Unable to verify the Organization management account.${NC}"
+        echo "AWS CLI error: $ORG_ERROR"
+        echo "You cannot onboard an AWS Organization from a member account."
         echo "Running permissions check anyway..."
-    else
-        echo
-        echo "AWS Organization Master Account not detected."
-        echo
-        echo "${RED}Failed Preflight Permissions Check${NC}"
-        echo "Please login in the Master Account and make sure you have permissions over the Organization"
-        echo "- organizations:DescribeOrganization"
-        echo "- organizations:DescribeOrganizationalUnit"
-        echo
-        exit 1
-    fi 
+    fi
 
-    # Detect principal ARN
-    if [[ "$IDENTITY_ARN" == *":user/"* ]]; then
-        ENTITY_ARN="$IDENTITY_ARN"
-    elif [[ "$IDENTITY_ARN" == *":assumed-role/"* ]]; then
-        ROLE_NAME=$(echo "$IDENTITY_ARN" | awk -F'/' '{print $2}')
-        ENTITY_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
-    elif [[ "$IDENTITY_ARN" == *":root" ]]; then
+    if [[ "$IDENTITY_ARN" == *":root" ]]; then
         echo "Detected CloudShell root ARN — All permission are satisfied"
-        exit 1
-    else
-        echo "Unsupported identity type: $IDENTITY_ARN"
-        exit 1
+        return 0
+    fi
+
+    if ! ENTITY_ARN=$(resolve_aws_principal_arn "$IDENTITY_ARN"); then
+        return 1
     fi
 
     echo "Simulating permissions for: $ENTITY_ARN"
     echo
-
-    DENIED_ACTIONS=()
 
     local audts=0
     local feats=0
@@ -672,24 +818,11 @@ aws_organization_check() {
             ;;
     esac
 
-    # Check each action
-    for ACTION in "${aws_org_actions[@]}"; do
-        RESULT=$(aws iam simulate-principal-policy \
-            --policy-source-arn "$ENTITY_ARN" \
-            --action-names "$ACTION" \
-            --query "EvaluationResults[0].EvalDecision" \
-            --output text 2>/dev/null || echo "ERROR")
+    check_aws_actions "$ENTITY_ARN" "${aws_org_actions[@]}"
 
-        if [[ "$RESULT" =~ ^[Aa]llowed$ ]]; then
-            echo -e "$ACTION: ${GREEN}Allowed${NC}"
-        elif [[ "$RESULT" =~ ^[Dd]enied$ ]]; then
-            echo "$ACTION: Denied"
-            DENIED_ACTIONS+=("$ACTION")
-        else
-            echo "$ACTION Failed verifying this permission."
-            DENIED_ACTIONS+=("$ACTION")
-        fi
-    done
+    if [ "$ORG_CHECK_FAILED" -eq 1 ]; then
+        AWS_VERIFICATION_ERRORS+=("Organization management account check: $ORG_ERROR")
+    fi
     
     echo
     print_header "Preflight Permissions Check Summary"
@@ -700,7 +833,7 @@ aws_organization_check() {
     echo
     echo "- Identity ARN: $IDENTITY_ARN"
     echo "- ACCOUNT ID: $ACCOUNT_ID"
-    echo "- Organization Master ACCOUNT ID: $ORG_ID"
+    echo "- Organization Management ACCOUNT ID: $ORG_ID"
     echo
     echo "Make sure these services are active in your AWS Organization:"
     echo "- AWS Account Management"
@@ -709,15 +842,14 @@ aws_organization_check() {
     echo
     echo "Make sure you have a service-linked role for CloudTrail."
 
-    if [ ${#DENIED_ACTIONS[@]} -eq 0 ]; then
-        echo -e "${GREEN}You have the required permissions.${NC}"
-    else
-        echo -e "${RED}Missing permissions:${NC}"
-        for PERM in "${DENIED_ACTIONS[@]}"; do
-            echo "   - $PERM"
-        done
-        echo 
-        echo "Please contact an administrator to enable those permissions."
+    if ! print_aws_permission_results; then
+        if [ "${#DENIED_ACTIONS[@]}" -gt 0 ]; then
+            echo "Please contact an administrator to enable the denied permissions."
+        fi
+        if [ "${#AWS_VERIFICATION_ERRORS[@]}" -gt 0 ]; then
+            echo "Resolve the verification errors above and re-run the preflight check."
+        fi
+        return 1
     fi
 }
 
